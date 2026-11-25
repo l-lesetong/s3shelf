@@ -1,0 +1,9 @@
+.DS_Store
+/build/
+/outputs/
+/work/
+*.app/
+*.pkg
+*.dmg
+*.zip
+__pycache__/
