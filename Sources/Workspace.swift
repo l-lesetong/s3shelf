@@ -11,6 +11,16 @@ struct Operation: Identifiable, Decodable, Sendable {
     let fileOutput: Bool
     let mutates: Bool
     var id: String { "\(service) \(name)" }
+    var createsBucket: Bool { service == "s3api" && name == "create-bucket" }
+    var bucketDeletionFields: [String] {
+        switch id {
+        case "s3api delete-bucket", "s3control delete-bucket": ["Bucket"]
+        case "s3tables delete-table-bucket": ["tableBucketARN"]
+        case "s3vectors delete-vector-bucket": ["vectorBucketName", "vectorBucketArn"]
+        default: []
+        }
+    }
+    var deletesBucket: Bool { !bucketDeletionFields.isEmpty }
 
     static func load() -> (operations: [Operation], templates: [String: [String: Any]]) {
         guard let url = Bundle.main.url(forResource: "operations", withExtension: "json"),
@@ -167,10 +177,15 @@ final class Workspace: ObservableObject {
     @Published var busy = false
     @Published var error: String?
     @Published var bucketError: String?
+    @Published private(set) var bucketCreationFeedback: BucketCreationFeedback?
+    @Published private(set) var bucketDeletionRunning = false
     @Published var transfers: [Transfer] = []
     @Published private(set) var events: [S3Event] = []
     @Published var operation: Operation?
-    @Published var parameters = "{}"
+    @Published var parameters = "{}" {
+        didSet { if apiRequestError != nil { apiRequestError = nil } }
+    }
+    @Published private(set) var apiRequestError: String?
     @Published var apiResult = ""
     @Published var apiBusy = false
     @Published var apiPaginate = false
@@ -180,6 +195,7 @@ final class Workspace: ObservableObject {
     @Published var bucketCursor: String?
     @Published private(set) var hasMoreObjects = false
     @Published private(set) var needsListingRefresh = false
+    @Published private(set) var inspectorCachePolicy: InspectorCachePolicy
     private var filteredItems: [S3Item] = []
     private var itemIndices: [String: Int] = [:]
     private var activeListing: ListingScope?
@@ -189,16 +205,26 @@ final class Workspace: ObservableObject {
     private var visitedCursors = Set<ListingCursor>()
     private var listingCache: [ListingScope: CachedListing] = [:]
     private var bucketTask: Task<Void, Never>?
+    private var bucketCreationTask: Task<Void, Never>?
+    private var bucketsAddedWhileListing: [Bucket] = []
+    private var bucketsRemovedWhileListing: Set<String> = []
     private var listingTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
     private var apiTask: Task<Void, Never>?
+    private var apiCreatingBucket = false
     private var transferTasks: [UUID: Task<Void, Never>] = [:]
     private var listGeneration = UUID()
     private var bucketGeneration = UUID()
+    private(set) var inspectorCache: InspectorCache
     let operations: [Operation]
+    private let defaults: UserDefaults
     private let templates: [String: [String: Any]]
 
     init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        let policy = InspectorCachePolicy(defaults: defaults)
+        inspectorCachePolicy = policy
+        inspectorCache = InspectorCache(policy: policy)
         let catalog = Operation.load()
         operations = catalog.operations
         templates = catalog.templates
@@ -221,7 +247,14 @@ final class Workspace: ObservableObject {
         }
     }
     var canWrite: Bool { connection != nil && connection?.auth != .anonymous }
+    var canCreateBucket: Bool { canWrite && bucketCreationFeedback?.isRunning != true && !apiCreatingBucket && !bucketDeletionRunning }
+    var canDeleteBucket: Bool { canCreateBucket }
+
+    func canDelete(_ bucket: Bucket) -> Bool {
+        canDeleteBucket && !bucket.Name.isEmpty && !bucket.Name.contains(":") && !bucket.Name.contains("/")
+    }
     var activeTransfers: Int { transfers.filter { $0.status == .queued || $0.status == .running }.count }
+    var hasRunningTransfers: Bool { transfers.contains { $0.status == .running } }
 
     func save(_ value: Connection, credentials: Credentials?) throws {
         if let credentials { try Keychain.save(credentials, for: value.id) }
@@ -239,13 +272,23 @@ final class Workspace: ObservableObject {
         if value.id == connection?.id { connect(nil) }
     }
 
+    func configureInspectorCache(_ policy: InspectorCachePolicy) {
+        guard policy != inspectorCachePolicy else { return }
+        inspectorCache.configure(policy)
+        inspectorCachePolicy = policy
+        policy.save(to: defaults)
+    }
+
     func connect(_ value: Connection?) {
         bucketTask?.cancel()
         resetListing()
         activeListing = nil
         listingCache.removeAll()
+        inspectorCache = InspectorCache(policy: inspectorCachePolicy)
         bucketGeneration = UUID()
         busyBuckets = false
+        bucketsAddedWhileListing = []
+        bucketsRemovedWhileListing = []
         connection = value
         buckets = []
         bucketCursor = nil
@@ -264,25 +307,24 @@ final class Workspace: ObservableObject {
         let cursor = more ? bucketCursor : nil
         busyBuckets = true
         bucketError = nil
+        bucketsAddedWhileListing = []
+        bucketsRemovedWhileListing = []
         bucketTask = Task {
-            defer { if generation == bucketGeneration { busyBuckets = false } }
-            do {
-                let base = ["s3api", "list-buckets", "--no-paginate"]
-                var response: Buckets
-                do {
-                    var args = base + ["--max-buckets=1000"]
-                    if let cursor { args.append("--continuation-token=\(cursor)") }
-                    response = try await Engine.json(Buckets.self, args, connection: connection)
-                } catch {
-                    guard cursor == nil, !Task.isCancelled, !connection.endpoint.isEmpty else { throw error }
-                    response = try await Engine.json(Buckets.self, base, connection: connection)
+            defer {
+                if generation == bucketGeneration {
+                    bucketsAddedWhileListing = []
+                    bucketsRemovedWhileListing = []
+                    busyBuckets = false
                 }
+            }
+            do {
+                let response = try await Self.loadBucketPage(connection, cursor: cursor)
                 guard generation == bucketGeneration else { return }
-                let returns = response.Buckets ?? []
-                if more {
-                    let seen = Set(buckets.map(\.id))
-                    buckets += returns.filter { !seen.contains($0.id) }
-                } else { buckets = returns }
+                let returns = (response.Buckets ?? []).filter { !bucketsRemovedWhileListing.contains($0.Name) }
+                let base = more ? buckets : returns
+                let seen = Set(base.map(\.id))
+                let additions = more ? returns : bucketsAddedWhileListing
+                buckets = base + additions.filter { !seen.contains($0.id) }
                 if let bucket, bucket.BucketRegion == nil, let match = buckets.first(where: { $0.id == bucket.id }) {
                     self.bucket = match
                 }
@@ -297,10 +339,25 @@ final class Workspace: ObservableObject {
         }
     }
 
-    func openBucket(_ bucket: Bucket?) {
+    private static func loadBucketPage(_ connection: Connection, cursor: String?) async throws -> Buckets {
+        let base = ["s3api", "list-buckets", "--no-paginate"]
+        var arguments = base + ["--max-buckets=1000"]
+        if let cursor { arguments.append("--continuation-token=\(cursor)") }
+        do {
+            return try await Engine.json(Buckets.self, arguments, connection: connection)
+        } catch {
+            guard cursor == nil, !Task.isCancelled, !connection.endpoint.isEmpty else { throw error }
+            let detail = error.localizedDescription
+            let unsupported = ["(InvalidArgument)", "(InvalidRequest)", "(InvalidMaxBuckets)", "(NotImplemented)", "(NotSupported)", "(400)", "(501)"]
+            guard unsupported.contains(where: detail.contains) else { throw error }
+            return try await Engine.json(Buckets.self, base, connection: connection)
+        }
+    }
+
+    func openBucket(_ bucket: Bucket?, prefix: String = "") {
         self.bucket = bucket
         destination = .browse
-        navigate(to: "", versions: false)
+        navigate(to: bucket == nil ? "" : prefix, versions: false)
     }
 
     func go(_ prefix: String) { navigate(to: prefix, versions: versions) }
@@ -436,6 +493,7 @@ final class Workspace: ObservableObject {
 
     private func invalidateListings(_ changes: [ObjectChange], connectionID: UUID) {
         guard connection?.id == connectionID, !changes.isEmpty else { return }
+        inspectorCache.invalidate(changes: changes)
         func affected(_ scope: ListingScope) -> Bool {
             let prefix = scope.prefix
             return changes.contains { $0.affects(bucket: scope.bucket, prefix: prefix) }
@@ -478,8 +536,8 @@ final class Workspace: ObservableObject {
         if !apiBusy { apiResult = "" }
         let available = templates[operation.id] ?? [:]
         var template = available.filter { operation.required.contains($0.key) }
-        if let bucket, operation.fields.contains("Bucket") { template["Bucket"] = bucket.Name }
-        if operation.id == "s3api create-bucket", let connection, !connection.region.isEmpty,
+        if let bucket, !operation.createsBucket, operation.fields.contains("Bucket") { template["Bucket"] = bucket.Name }
+        if operation.createsBucket, let connection, !connection.region.isEmpty,
            connection.region != "us-east-1", connection.endpoint.isEmpty {
             template["CreateBucketConfiguration"] = ["LocationConstraint": connection.region]
         }
@@ -494,7 +552,7 @@ final class Workspace: ObservableObject {
     }
 
     func defaultValue(for field: String, in operation: Operation) -> Any {
-        if field == "Bucket", let bucket { return bucket.Name }
+        if field == "Bucket", let bucket, !operation.createsBucket { return bucket.Name }
         return templates[operation.id]?[field] ?? ""
     }
 
@@ -502,74 +560,484 @@ final class Workspace: ObservableObject {
         if let operation = operations.first(where: { $0.id == "s3api \(command)" }) { fill(operation, fields: fields) }
     }
 
-    func execute() {
-        guard let operation, let connection = currentConnection, !apiBusy else { return }
-        let input = inputFile
-        let output = outputFile
+    static func bucketNameError(_ name: String, aws: Bool) -> String? {
+        if name.isEmpty { return "请输入存储桶名称。" }
+        if !(3...63).contains(name.count) { return "存储桶名称需要 3–63 个字符。" }
+        if name.range(of: #"\A[a-z0-9][a-z0-9.-]*[a-z0-9]\z"#, options: .regularExpression) == nil {
+            return "请以小写字母或数字开头和结尾，中间可使用小写字母、数字、连字符或英文句点。"
+        }
+        if name.contains("..") { return "存储桶名称不能有连续的英文句点。" }
+        if name.range(of: #"\A(?:[0-9]{1,3}\.){3}[0-9]{1,3}\z"#, options: .regularExpression) != nil {
+            return "请使用存储桶名称，不能使用 IP 地址格式。"
+        }
+        if aws && (["xn--", "sthree-", "amzn-s3-demo-"].contains(where: name.hasPrefix) ||
+                   ["-s3alias", "--ol-s3", ".mrap", "--x-s3", "--table-s3", "-an"].contains(where: name.hasSuffix)) {
+            return "该前缀或后缀由 Amazon S3 保留，请换一个名称。"
+        }
+        return nil
+    }
+
+    static func bucketRegionError(_ region: String) -> String? {
+        let value = region.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.isEmpty || value.range(of: #"\A[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+\z"#, options: .regularExpression) != nil {
+            return nil
+        }
+        return "请输入 AWS 区域代码，例如 ap-southeast-1。"
+    }
+
+    func resetBucketCreation() {
+        if bucketCreationFeedback?.isRunning != true { bucketCreationFeedback = nil }
+    }
+
+    func clearBucketCreationFailure() {
+        if bucketCreationFeedback?.phase == .failed { bucketCreationFeedback = nil }
+    }
+
+    func createBucket(_ name: String, awsRegion: String, connection: Connection) {
+        guard self.connection == connection, canCreateBucket else { return }
+        let aws = connection.endpoint.isEmpty
+        if let message = Self.bucketNameError(name, aws: aws) ?? (aws ? Self.bucketRegionError(awsRegion) : nil) {
+            bucketCreationFeedback = .init(phase: .failed, title: "请检查创建信息", message: message)
+            return
+        }
+        if let existing = buckets.first(where: { $0.Name == name }) {
+            bucketCreationFeedback = .init(phase: .available, title: "已有存储桶「\(name)」",
+                                           message: "此连接的侧栏清单中已有同名存储桶，可以直接打开。", bucket: existing)
+            return
+        }
+        bucketCreationFeedback = .init(phase: .creating, title: "正在创建「\(name)」",
+                                       message: "等待「\(connection.name)」返回结果。")
+        bucketCreationTask = Task {
+            defer { bucketCreationTask = nil }
+            var target = connection
+            var parameters: [String: Any] = ["Bucket": name]
+            do {
+                if aws {
+                    let requestedRegion = awsRegion.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let region = try await Self.resolveBucketRegion(requestedRegion, connection: connection)
+                    target.region = region
+                    if region != "us-east-1" {
+                        parameters["CreateBucketConfiguration"] = ["LocationConstraint": region]
+                    }
+                }
+                try Task.checkCancellation()
+                let input = try JSONSerialization.data(withJSONObject: parameters)
+                let createdRegion = aws ? target.region : nil
+                let (feedback, _) = await runBucketCreation(["s3api", "create-bucket", "--output=json"], input: input,
+                                                           name: name, target: target, connection: connection, createdRegion: createdRegion) {
+                    self.bucketCreationFeedback = .init(phase: .checking, title: "正在核对「\(name)」",
+                                                        message: "创建响应需要核对，正在查询存储桶清单。")
+                }
+                bucketCreationFeedback = feedback
+            } catch is CancellationError {
+                bucketCreationFeedback = .init(phase: .failed, title: "已停止创建", message: "请求尚未发送，可以重新提交。")
+            } catch {
+                bucketCreationFeedback = .init(phase: .failed, title: "无法准备创建请求",
+                                               message: "请检查连接的 AWS 区域设置。", details: error.localizedDescription)
+            }
+        }
+    }
+
+    private static func resolveBucketRegion(_ requested: String, connection: Connection) async throws -> String {
+        if !requested.isEmpty { return requested }
+        if !connection.region.isEmpty { return connection.region }
+        let environment = Engine.profileEnvironment()
+        if let region = [environment["AWS_REGION"], environment["AWS_DEFAULT_REGION"]].compactMap({ $0 }).first(where: { !$0.isEmpty }) {
+            return region
+        }
+        if connection.auth == .profile {
+            let profile = connection.profile.isEmpty ? [] : ["--profile=\(connection.profile)"]
+            do {
+                let region = try await Engine.run(["configure", "get", "region"] + profile)
+                let value = String(decoding: region, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !value.isEmpty { return value }
+            } catch let error as ShelfError where error.message == "AWS CLI 退出状态码 1。" {
+                // A configured profile can omit the region.
+            }
+        }
+        return "us-east-1"
+    }
+
+    func cancelBucketCreation() { bucketCreationTask?.cancel() }
+
+    func recheckBucketCreation(_ name: String, connection: Connection) {
+        guard self.connection == connection, canCreateBucket, let previous = bucketCreationFeedback,
+              previous.phase == .uncertain else { return }
+        bucketCreationFeedback = .init(phase: .checking, title: "正在核对「\(name)」",
+                                       message: "正在查询「\(connection.name)」的存储桶清单。")
+        bucketCreationTask = Task {
+            defer { bucketCreationTask = nil }
+            bucketCreationFeedback = await checkBucketCreation(name, connection: connection, cursor: previous.cursor,
+                                                               details: previous.details)
+        }
+    }
+
+    private func addCreatedBucket(_ bucket: Bucket, connection: Connection) {
+        guard self.connection == connection else { return }
+        if let index = buckets.firstIndex(where: { $0.Name == bucket.Name }) {
+            if buckets[index].BucketRegion == nil, bucket.BucketRegion != nil { buckets[index] = bucket }
+        } else { buckets.append(bucket) }
+        if busyBuckets && !bucketsAddedWhileListing.contains(where: { $0.Name == bucket.Name }) {
+            bucketsAddedWhileListing.append(bucket)
+        }
+    }
+
+    private func runBucketCreation(_ arguments: [String], input: Data?, name: String, target: Connection,
+                                   connection: Connection, createdRegion: String? = nil,
+                                   onCheck: () -> Void) async -> (BucketCreationFeedback, Data?) {
+        let capture = ResponseCapture()
         do {
-            guard let object = try JSONSerialization.jsonObject(with: Data(parameters.utf8)) as? [String: Any] else {
-                throw ShelfError("参数必须是 JSON 对象。")
+            let output = try await Engine.run(arguments, connection: target, inputJSON: input, maxAttempts: 1,
+                                              response: { capture.set($0) })
+            let http = capture.get()
+            let created = Bucket(Name: name, BucketRegion: createdRegion)
+            addCreatedBucket(created, connection: connection)
+            record(S3Event(action: "s3api create-bucket", resource: name, success: true,
+                           requestID: http?.requestID, status: http?.status))
+            let location = createdRegion.map { "，区域为 \($0)" } ?? ""
+            return (.init(phase: .created, title: "已创建「\(name)」",
+                          message: "目标连接「\(connection.name)」\(location)。", bucket: created), output)
+        } catch {
+            let http = capture.get()
+            let cancelled = error is CancellationError || Task.isCancelled
+            let cliError = error.localizedDescription
+            let status = http?.operationStatus
+            let details = cancelled ? "" : [http.map(Self.bucketResponseDiagnostics), cliError]
+                .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n")
+            record(S3Event(action: "s3api create-bucket", resource: name, success: false,
+                           requestID: http?.requestID ?? http?.header("x-request-id"), status: http?.status))
+            if cancelled {
+                return (.init(phase: .uncertain, title: "已停止等待",
+                              message: "端点可能已收到创建请求。请先核对存储桶清单。"), nil)
+            }
+            let needsVerification: Bool
+            if let status {
+                // A failed CLI command can follow a successful HTTP exchange and leave the bucket on the server.
+                needsVerification = (200..<300).contains(status) || (500..<600).contains(status)
+            } else {
+                needsVerification = cliError.range(of: #"^aws: \[ERROR\]: An error occurred \(5[0-9]{2}\) when calling the CreateBucket operation\b"#,
+                                                   options: .regularExpression) != nil
+            }
+            if needsVerification {
+                onCheck()
+                return (await checkBucketCreation(name, connection: connection, cursor: nil, details: details), nil)
+            }
+            if http?.errorCode == "BucketAlreadyOwnedByYou" {
+                let existing = buckets.first { self.connection == connection && $0.Name == name } ?? Bucket(Name: name)
+                addCreatedBucket(existing, connection: connection)
+                return (.init(phase: .available, title: "已有存储桶「\(name)」",
+                              message: "端点确认当前账号拥有这个存储桶，可以直接打开。", details: details, bucket: existing), nil)
+            }
+            let message: String
+            switch http?.errorCode {
+            case "BucketAlreadyExists":
+                message = "名称已被占用。请换一个存储桶名称。"
+            case "InvalidBucketName":
+                message = "端点拒绝了此名称。请检查存储桶命名规则。"
+            case "IllegalLocationConstraintException", "InvalidLocationConstraint", "AuthorizationHeaderMalformed":
+                message = "请检查 AWS 区域与目标端点的配置。"
+            case "TooManyBuckets":
+                message = "账号已达到存储桶数量上限。"
+            default:
+                if status == 401 || status == 403 {
+                    message = "请检查连接凭证，以及账号是否具备创建存储桶的权限。"
+                } else if status == nil || status == 408 {
+                    return (.init(phase: .uncertain, title: "无法确认创建结果",
+                                  message: "请检查连接、凭证或证书设置，再核对存储桶清单。", details: details), nil)
+                } else {
+                    message = "端点拒绝了创建请求。请查看技术详情。"
+                }
+            }
+            return (.init(phase: .failed, title: "无法创建「\(name)」", message: message, details: details), nil)
+        }
+    }
+
+    private func checkBucketCreation(_ name: String, connection: Connection, cursor: String?,
+                                     details: String) async -> BucketCreationFeedback {
+        do {
+            let page = try await Self.loadBucketPage(connection, cursor: cursor)
+            if let match = page.Buckets?.first(where: { $0.Name == name }) {
+                addCreatedBucket(match, connection: connection)
+                return .init(phase: .available, title: "存储桶清单中已找到「\(name)」",
+                             message: "可以打开清单中的同名存储桶，避免重复创建。", details: details, bucket: match)
+            }
+            if let next = page.ContinuationToken, !next.isEmpty {
+                if next == cursor {
+                    return .init(phase: .uncertain, title: "无法继续核对存储桶清单",
+                                 message: "端点返回了重复的分页标记。可以重新查询清单或查看端点日志。", details: details)
+                }
+                return .init(phase: .uncertain, title: "本页未找到「\(name)」",
+                             message: "存储桶清单还有后续页面，可以继续核对。", details: details, cursor: next)
+            }
+            return .init(phase: .uncertain, title: "清单中未找到「\(name)」",
+                         message: "当前账号可见的清单无法确认创建结果。请核对端点日志或稍后再查。", details: details)
+        } catch is CancellationError {
+            return .init(phase: .uncertain, title: "已停止核对",
+                         message: "创建结果仍待确认。可以重新查询存储桶清单。", details: details, cursor: cursor)
+        } catch {
+            return .init(phase: .uncertain, title: "无法核对存储桶清单",
+                         message: "请检查连接和列出存储桶的权限，或从端点日志核对创建结果。",
+                         details: details, verificationDetails: error.localizedDescription, cursor: cursor)
+        }
+    }
+
+    func bucketDeletionRequest(for bucket: Bucket) -> BucketDeletionRequest? {
+        guard let connection, canDelete(bucket) else { return nil }
+        return try? Self.makeBucketDeletionRequest(service: "s3api", command: "delete-bucket",
+                                                   resource: bucket.Name, connection: connection, region: bucket.BucketRegion,
+                                                   parameters: ["Bucket": bucket.Name])
+    }
+
+    func workbenchBucketDeletionRequest() -> BucketDeletionRequest? {
+        guard let operation, operation.deletesBucket, let connection, canDeleteBucket,
+              let parameters = validatedAPIRequest() else { return nil }
+        let resources = operation.bucketDeletionFields.compactMap { parameters[$0] }
+        guard resources.count == 1, let resource = resources.first as? String, !resource.isEmpty,
+              resource == resource.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            apiRequestError = "请填写一个有效的存储桶名称或 ARN。"
+            return nil
+        }
+        let region = operation.service == "s3api"
+            ? buckets.first(where: { $0.Name == resource })?.BucketRegion ?? (bucket?.Name == resource ? bucket?.BucketRegion : nil)
+            : nil
+        do {
+            return try Self.makeBucketDeletionRequest(service: operation.service, command: operation.name,
+                                                      resource: resource, connection: connection, region: region,
+                                                      parameters: parameters, fromWorkbench: true)
+        } catch {
+            apiRequestError = error.localizedDescription
+            return nil
+        }
+    }
+
+    private static func makeBucketDeletionRequest(service: String, command: String, resource: String, connection: Connection,
+                                                  region: String?, parameters: [String: Any],
+                                                  fromWorkbench: Bool = false) throws -> BucketDeletionRequest {
+        var target = connection
+        if let region, !region.isEmpty { target.region = region }
+        let name: String
+        if resource.hasPrefix("arn:") {
+            let arn = resource.split(separator: ":", maxSplits: 5, omittingEmptySubsequences: false)
+            let components = arn.last?.split(separator: "/", omittingEmptySubsequences: false)
+            guard arn.count == 6, let components, components.dropLast().last == "bucket",
+                  let last = components.last, !last.isEmpty else {
+                throw ShelfError("请输入存储桶的 ARN。")
+            }
+            name = String(last)
+        } else {
+            name = resource
+        }
+        guard !name.utf8.contains(0), !name.contains(":"), !name.contains("/") else {
+            throw ShelfError("请输入有效的存储桶名称。")
+        }
+        let input = try JSONSerialization.data(withJSONObject: parameters)
+        return .init(connection: connection, target: target, operation: "\(service) \(command)",
+                     arguments: [service, command, "--output=json", "--no-paginate"], input: input,
+                     resource: resource, name: name,
+                     accountID: (parameters["AccountId"] ?? parameters["ExpectedBucketOwner"]) as? String,
+                     fromWorkbench: fromWorkbench)
+    }
+
+    func deleteBucket(_ request: BucketDeletionRequest, confirmedName: String) async -> BucketDeletionFeedback? {
+        guard request.matches(confirmedName), connection == request.connection, canDeleteBucket else { return nil }
+        bucketDeletionRunning = true
+        defer { bucketDeletionRunning = false }
+        let capture = ResponseCapture()
+        let result: BucketDeletionFeedback
+        do {
+            _ = try await Engine.run(request.arguments, connection: request.target, inputJSON: request.input,
+                                     maxAttempts: 1, response: { capture.set($0) })
+            result = .init(title: "已删除「\(request.name)」", message: "存储桶已从「\(request.connection.name)」删除。", removed: true)
+        } catch {
+            result = Self.bucketDeletionFailure(request, response: capture.get(), error: error)
+        }
+        let http = capture.get()
+        record(S3Event(action: request.operation, resource: request.resource, success: result.removed,
+                       requestID: http?.requestID ?? http?.header("x-request-id"), status: http?.status))
+        if result.removed, request.isS3Bucket, connection == request.connection {
+            let name = request.name
+            buckets.removeAll { $0.Name == name }
+            bucketsAddedWhileListing.removeAll { $0.Name == name }
+            if busyBuckets { bucketsRemovedWhileListing.insert(name) }
+            if bucket?.Name == name || bucket?.Name == request.resource {
+                let currentDestination = destination
+                openBucket(nil)
+                destination = currentDestination
+            }
+            listingCache = listingCache.filter { $0.key.bucket != name }
+            inspectorCache.invalidate(changes: [ObjectChange(bucket: name)])
+        }
+        if request.fromWorkbench { apiResult = result.text }
+        return result
+    }
+
+    private static func bucketDeletionFailure(_ request: BucketDeletionRequest, response: S3HTTPResponse?,
+                                              error: any Error) -> BucketDeletionFeedback {
+        let cliError = error.localizedDescription
+        let details = [response.map(Self.bucketResponseDiagnostics), cliError]
+            .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n")
+        let status = response?.operationStatus
+        let title = "无法删除「\(request.name)」"
+        switch response?.errorCode {
+        case "NoSuchBucket":
+            return .init(title: "「\(request.name)」已不存在", message: "端点报告找不到此存储桶。", details: details, removed: true)
+        case "BucketNotEmpty":
+            return .init(title: title, message: "存储桶仍有内容。请处理全部对象、历史版本和删除标记后，再输入桶名确认删除。", details: details)
+        default:
+            if status == 401 || status == 403 {
+                return .init(title: title, message: "请核对目标账号、连接凭证和删除存储桶的权限。", details: details)
+            }
+            if status == 409 {
+                return .init(title: title, message: "端点报告资源冲突。请检查存储桶是否为空，并查看技术详情。", details: details)
+            }
+            if let status, (400..<500).contains(status), status != 408, !(error is CancellationError) {
+                return .init(title: title, message: "端点拒绝了删除请求。请查看技术详情。", details: details)
+            }
+            return .init(title: "删除结果待确认", message: "请刷新目标连接的存储桶清单，或通过端点日志核对删除结果。", details: details)
+        }
+    }
+
+    func validatedAPIRequest() -> [String: Any]? {
+        guard let operation, !apiBusy else { return nil }
+        do {
+            let object = try Self.decodeAPIRequest(parameters)
+            if operation.createsBucket {
+                guard let name = object["Bucket"] as? String, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw ShelfError("请在 Bucket 中填写新存储桶的名称。")
+                }
             }
             let missing = operation.required.filter { field in
-                if field == operation.fileInput { return input == nil && (object[field] as? String ?? "").isEmpty }
+                if field == operation.fileInput { return inputFile == nil && (object[field] as? String ?? "").isEmpty }
                 return object[field] == nil || object[field] is NSNull
             }
             guard missing.isEmpty else { throw ShelfError("请填写必填参数 \(missing.joined(separator: "、"))。") }
-            guard !operation.fileOutput || output != nil else { throw ShelfError("请选择输出文件。") }
+            guard !operation.fileOutput || outputFile != nil else { throw ShelfError("请选择输出文件。") }
+            apiRequestError = nil
+            return object
+        } catch {
+            apiRequestError = error.localizedDescription
+            return nil
+        }
+    }
+
+    func execute() {
+        guard let operation, !operation.deletesBucket, let connection = operation.createsBucket ? self.connection : currentConnection,
+              !apiBusy, !bucketDeletionRunning, !operation.mutates || canWrite, !operation.createsBucket || canCreateBucket,
+              let object = validatedAPIRequest() else { return }
+        let input = inputFile
+        let output = outputFile
+        do {
             var args = [operation.service] + operation.name.split(separator: " ").map(String.init)
             args.append("--output=json")
             if !apiPaginate { args.append("--no-paginate") }
             if !apiQuery.isEmpty { args.append("--query=\(apiQuery)") }
             if let field = operation.fileInput, let input { args.append("--\(Self.kebab(field))=\(input.path)") }
             let stage = output.map { $0.deletingLastPathComponent().appendingPathComponent(".s3-\(UUID().uuidString).download") }
+            var literalObjectKey: String?
             if let stage, operation.fileOutput {
-                args += try Self.streamingArguments(object, allowed: operation.fields)
+                var arguments = object
+                if let key = object["Key"] as? String {
+                    guard !key.utf8.contains(0) else { throw ShelfError("对象键不能包含空字符。") }
+                    if key.utf8.contains(where: { $0 >= 128 }) {
+                        literalObjectKey = key
+                        arguments["Key"] = nil
+                    }
+                }
+                args += try Self.streamingArguments(arguments, allowed: operation.fields)
                 args.append(stage.path)
             }
             if operation.fields.contains("RequestPayer"), object["RequestPayer"] == nil { args += payer(connection) }
             let data = operation.fileOutput ? nil : try JSONSerialization.data(withJSONObject: object)
+            let arguments = args
+            if operation.createsBucket, let name = object["Bucket"] as? String {
+                apiCreatingBucket = true
+                apiBusy = true
+                apiResult = "正在通过「\(connection.name)」创建「\(name)」…"
+                apiTask = Task {
+                    defer { apiCreatingBucket = false; apiBusy = false }
+                    let (feedback, output) = await runBucketCreation(arguments, input: data, name: name, target: connection,
+                                                                    connection: connection) {
+                        self.apiResult = "创建响应需要核对，正在查询存储桶清单…"
+                    }
+                    apiResult = feedback.text
+                    if let output, !output.isEmpty { apiResult += "\n\n" + String(decoding: output, as: UTF8.self) }
+                }
+                return
+            }
             apiBusy = true
             apiResult = "正在运行 \(operation.id)…"
-            let arguments = args
+            let details = inspectorCache
             apiTask = Task {
                 defer {
                     apiBusy = false
                     if let stage { try? FileManager.default.removeItem(at: stage) }
+                    if operation.service == "s3api", operation.mutates, let bucket = object["Bucket"] as? String {
+                        details.invalidateMutation(operation.name, change: ObjectChange(bucket: bucket, key: object["Key"] as? String))
+                    }
                 }
                 do {
-                    let response = try await Engine.run(arguments, connection: connection, inputJSON: data)
+                    let response = try await Engine.run(arguments, connection: connection, inputJSON: data,
+                                                        literalObjectKey: literalObjectKey)
                     if let stage, let output { try Self.finalizeDownload(stage, to: output) }
                     let result = String(decoding: response, as: UTF8.self)
                     apiResult = result.isEmpty ? "\(operation.id) 已完成。" : result
-                    record(S3Event(action: operation.id, resource: object["Bucket"] as? String ?? connection.name, success: true))
+                    record(S3Event(action: operation.id, resource: object["Bucket"] as? String ?? connection.name,
+                                   success: true))
                     if operation.mutates && operation.service == "s3api" {
                         let targetBucket = object["Bucket"] as? String
-                        if self.connection?.id == connection.id, operation.name == "create-bucket" || operation.name == "delete-bucket" {
-                            listBuckets()
-                            if operation.name == "delete-bucket", bucket?.Name == targetBucket {
-                                openBucket(nil)
-                                destination = .api
-                            }
-                        }
                         if let targetBucket {
                             let changes: [ObjectChange]
                             switch operation.name {
                             case "put-object", "copy-object", "complete-multipart-upload", "delete-object", "restore-object":
                                 changes = [ObjectChange(bucket: targetBucket, key: object["Key"] as? String)]
-                            case "rename-object", "delete-objects", "delete-bucket":
+                            case "rename-object", "delete-objects":
                                 changes = [ObjectChange(bucket: targetBucket)]
                             default: changes = []
                             }
                             invalidateListings(changes, connectionID: connection.id)
                         }
                     }
-                } catch is CancellationError { apiResult = "已取消等待。请刷新相关资源以确认 AWS 端的结果。" }
+                } catch is CancellationError {
+                    apiResult = operation.mutates ? "已停止等待。请刷新相关资源以确认目标端点的处理结果。" : "已停止等待。"
+                }
                 catch {
-                    apiResult = error.localizedDescription
+                    apiResult = "执行 \(operation.name) 失败。\n\n\(error.localizedDescription)"
                     record(S3Event(action: operation.id, resource: object["Bucket"] as? String ?? connection.name, success: false))
                 }
             }
-        } catch { apiResult = error.localizedDescription }
+        } catch {
+            apiRequestError = error.localizedDescription
+            apiResult = ""
+        }
+    }
+
+    private static func bucketResponseDiagnostics(_ response: S3HTTPResponse) -> String {
+        var lines: [String] = []
+        if let status = response.status { lines.append("网关响应 HTTP \(status)") }
+        if let status = response.sdkStatus { lines.append("AWS CLI 将响应按服务错误处理（\(status)）") }
+        if let code = response.errorCode { lines.append("S3 错误码 \(code)") }
+        if let id = response.requestID { lines.append("S3 请求 ID \(id)") }
+        else if let id = response.header("x-request-id") { lines.append("端点请求 ID \(id)") }
+        if let server = response.header("server") { lines.append("Server \(server)") }
+        if let contentType = response.header("content-type") { lines.append("Content-Type \(contentType)") }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func decodeAPIRequest(_ text: String) throws -> [String: Any] {
+        let parsed: Any
+        do {
+            parsed = try JSONSerialization.jsonObject(with: Data(text.utf8), options: [.fragmentsAllowed])
+        } catch {
+            let details = (error as NSError).userInfo[NSDebugDescriptionErrorKey] as? String
+            var message = "请求 JSON 格式错误。"
+            if text.contains("“") || text.contains("”") {
+                message += "字段名和字符串两端请使用英文直双引号（\"）。"
+            }
+            if let details { message += "\n\(details)" }
+            throw ShelfError(message)
+        }
+        guard let object = parsed as? [String: Any] else { throw ShelfError("请求参数必须是 JSON 对象，例如 {\"Bucket\": \"example-bucket\"}。") }
+        return object
     }
 
     func cancelAPI() { apiTask?.cancel() }

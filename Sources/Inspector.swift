@@ -12,13 +12,6 @@ struct S3Event: Identifiable {
     var status: Int? = nil
 }
 
-private final class ResponseCapture: @unchecked Sendable {
-    private let lock = NSLock()
-    private var response: S3HTTPResponse?
-    func set(_ response: S3HTTPResponse) { lock.withLock { self.response = response } }
-    func get() -> S3HTTPResponse? { lock.withLock { response } }
-}
-
 struct InspectorTarget: Hashable {
     let connectionID: UUID
     let bucket: Bucket
@@ -28,6 +21,7 @@ struct InspectorTarget: Hashable {
     var identifier: String { item?.key ?? bucket.Name }
     var location: String { Engine.s3URI(bucket.Name, item?.key ?? prefix) }
     var object: S3Item? { item?.kind == .folder ? nil : item }
+    var supportsAccessManagement: Bool { item?.kind != .folder && item?.kind != .deleteMarker }
     var scope: String {
         switch item?.kind {
         case .folder: "前缀"
@@ -48,6 +42,14 @@ struct InspectorClient {
     let model: Workspace
     let target: InspectorTarget
     let connection: Connection
+    let inspectorCache: InspectorCache
+
+    init(model: Workspace, target: InspectorTarget, connection: Connection) {
+        self.model = model
+        self.target = target
+        self.connection = connection
+        inspectorCache = model.inspectorCache
+    }
 
     struct Result {
         var data = Data()
@@ -60,14 +62,14 @@ struct InspectorClient {
     }
 
     func fetch(_ command: String, args: [String] = [], requesterPays: Bool = false,
-               headers: Bool = false) async throws -> Result {
+               headers: Bool = false, inputJSON: Data? = nil) async throws -> Result {
         let capture = ResponseCapture()
         let callback: ResponseHandler? = headers ? { @Sendable in capture.set($0) } : nil
         let options = requesterPays ? model.payer(connection) : []
         var result: Result
         do {
             let data = try await Engine.run(["s3api", command, "--bucket=\(target.bucket.Name)", "--no-paginate", "--output=json"] + args + options,
-                                            connection: connection, response: callback)
+                                            connection: connection, inputJSON: inputJSON, response: callback)
             try Task.checkCancellation()
             result = Result(data: data, response: capture.get())
         } catch {
@@ -84,6 +86,28 @@ struct InspectorClient {
             return try await fetch("head-object", args: target.objectArguments, requesterPays: true, headers: headers)
         }
         return try await fetch("head-bucket", headers: headers)
+    }
+
+    func readHeaders() async throws -> InspectorReading<Result> {
+        try await inspectorCache.load(target, kind: .headers) {
+            let result: Result
+            if let object = target.object {
+                // Preserve the exact UTF-8 object key in the request.
+                var parameters = ["Key": object.key]
+                parameters["VersionId"] = object.version
+                let data = try JSONSerialization.data(withJSONObject: parameters)
+                result = try await fetch("head-object", requesterPays: true, headers: true, inputJSON: data)
+            } else {
+                result = try await head(headers: true)
+            }
+            guard result.error == nil, let response = result.response, !response.headers.isEmpty else {
+                return (result, nil)
+            }
+            let bytes = response.headers.reduce(result.data.count + (response.url?.utf8.count ?? 0)) {
+                $0 + 64 + $1.key.utf8.count + $1.value.utf8.count
+            }
+            return (result, bytes)
+        }
     }
 
     func versions(after cursor: VersionCursor?) async throws -> (items: [S3Item], next: VersionCursor?) {
@@ -186,6 +210,38 @@ enum InspectorTab: String, CaseIterable, Identifiable {
     case preview = "预览", versions = "版本", tasks = "任务", events = "事件日志"
     var id: Self { self }
     var needsRequest: Bool { self != .tasks && self != .events }
+    var cacheKinds: Set<InspectorCacheKind> {
+        switch self {
+        case .permissions: InspectorCacheKind.permissions
+        case .headers: [.headers]
+        case .tags: [.tags]
+        default: []
+        }
+    }
+    var requiresAccessTarget: Bool { self == .permissions || self == .tags }
+}
+
+struct InspectorCacheTimestamp: View {
+    let date: Date
+    var source = ""
+    let refreshLabel: String
+    var isRefreshing = false
+    let refresh: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Label("\(source)缓存 · \(date.formatted(date: .numeric, time: .standard))", systemImage: "clock")
+                .foregroundStyle(.secondary)
+                .help("从服务端读取的时间")
+            Button("刷新", action: refresh)
+                .buttonStyle(.borderless)
+                .foregroundStyle(Color.accentColor)
+                .disabled(isRefreshing)
+                .accessibilityLabel(refreshLabel)
+                .help("\(refreshLabel)，从服务端重新读取")
+        }
+        .font(.caption)
+    }
 }
 
 struct InspectorPane: View {
@@ -197,6 +253,10 @@ struct InspectorPane: View {
     @State private var reload = 0
 
     var body: some View {
+        let hasMultipleSelection = tab.requiresAccessTarget && model.selection.count > 1
+        let isCachedTab = !tab.cacheKinds.isEmpty
+        let shouldLoad = tab.needsRequest && (isCachedTab || requestedTarget == target) && !hasMultipleSelection
+        let refreshLabel = isCachedTab ? "强制刷新\(tab.rawValue)" : "刷新详情"
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 10) {
                 Label(target.scope, systemImage: target.item?.icon ?? "shippingbox")
@@ -206,14 +266,16 @@ struct InspectorPane: View {
                 Spacer(minLength: 0)
                 Button { copy(target.location) } label: { Image(systemName: "document.on.document") }
                     .buttonStyle(.borderless).help("复制 S3 URI")
-                if tab.needsRequest && requestedTarget == target {
-                    Button { reload += 1 } label: { Image(systemName: "arrow.clockwise") }
-                        .buttonStyle(.borderless).help("刷新详情")
+                if shouldLoad && (!tab.requiresAccessTarget || target.supportsAccessManagement) {
+                    Button(action: refreshCurrentTab) { Image(systemName: "arrow.clockwise") }
+                        .buttonStyle(.borderless)
+                        .accessibilityLabel(refreshLabel)
+                        .help(isCachedTab ? "\(refreshLabel)，从服务端重新读取" : refreshLabel)
                 }
             }.padding(.horizontal, 17).padding(.top, 10).padding(.bottom, 8)
             Picker("详情", selection: Binding(get: { tab }, set: { selection in
                 tab = selection
-                requestedTarget = selection.needsRequest ? target : nil
+                requestedTarget = selection.needsRequest && selection.cacheKinds.isEmpty ? target : nil
             })) {
                 ForEach(InspectorTab.allCases) { tab in Text(tab.rawValue).tag(tab) }
             }.pickerStyle(.segmented).labelsHidden().padding(.horizontal, 17).padding(.bottom, 9)
@@ -224,10 +286,17 @@ struct InspectorPane: View {
             case .events:
                 events
             default:
-                if requestedTarget == target, let connection = model.currentConnection {
-                    InspectorContent(client: InspectorClient(model: model, target: target, connection: connection),
-                                     tab: tab, download: download)
-                        .id(ContentID(target: target, tab: tab, reload: reload))
+                if hasMultipleSelection {
+                    Text("选择单个资源后可管理权限和标签。").foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(17)
+                } else if shouldLoad, let connection = model.currentConnection {
+                    let client = InspectorClient(model: model, target: target, connection: connection)
+                    Group {
+                        if tab == .permissions || tab == .tags { AccessManagementPane(client: client, tagsOnly: tab == .tags) }
+                        else { InspectorContent(client: client, tab: tab, download: download, refresh: refreshCurrentTab) }
+                    }.id(ContentID(target: target, tab: tab, reload: reload,
+                                   cacheSession: isCachedTab ? ObjectIdentifier(client.inspectorCache) : nil,
+                                   cacheEnabled: isCachedTab && model.inspectorCachePolicy.lifetimeSeconds > 0))
                 } else {
                     VStack(alignment: .leading, spacing: 9) {
                         if let item = target.item {
@@ -250,10 +319,17 @@ struct InspectorPane: View {
             }
     }
 
+    private func refreshCurrentTab() {
+        model.inspectorCache.invalidate(target, kinds: tab.cacheKinds)
+        reload += 1
+    }
+
     private struct ContentID: Hashable {
         let target: InspectorTarget
         let tab: InspectorTab
         let reload: Int
+        let cacheSession: ObjectIdentifier?
+        let cacheEnabled: Bool
     }
 
     private var events: some View {
@@ -295,7 +371,9 @@ private struct InspectorContent: View {
     let client: InspectorClient
     let tab: InspectorTab
     let download: (S3Item) -> Void
+    let refresh: () -> Void
     @State private var sections: [DetailsSection] = []
+    @State private var headersCachedAt: Date?
     @State private var preview: InspectorPreview?
     @State private var versions: [S3Item] = []
     @State private var cursor: VersionCursor?
@@ -308,6 +386,9 @@ private struct InspectorContent: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
+                if let headersCachedAt {
+                    InspectorCacheTimestamp(date: headersCachedAt, refreshLabel: "刷新响应头", refresh: refresh)
+                }
                 ForEach(sections) { section in sectionView(section) }
                 if let preview { previewView(preview) }
                 if tab == .versions { versionRows }
@@ -411,14 +492,15 @@ private struct InspectorContent: View {
             switch tab {
             case .properties: sections = try await properties()
             case .headers:
-                let result = try await client.head(headers: true)
+                let reading = try await client.readHeaders()
+                try Task.checkCancellation()
+                headersCachedAt = reading.cachedAt
+                let result = reading.value
                 let title = result.response?.status.map { "HTTP \($0)" } ?? "HTTP 响应头"
                 let headers = result.response?.headers ?? [:]
                 let address = result.response?.url.map { [DetailsRow(name: "请求 URL", value: $0)] } ?? []
                 sections = [DetailsSection(title: title, rows: address + rows(headers),
                                            note: result.error ?? (headers.isEmpty ? "端点未返回可显示的响应头。" : nil), error: result.error != nil)]
-            case .permissions: sections = try await permissions()
-            case .tags: sections = [try await tags()]
             case .preview:
                 if let object = target.object, object.kind != .deleteMarker { preview = try await client.preview() }
                 else { error = target.object == nil ? "选择一个对象以查看预览。" : "删除标记没有可预览的内容。" }
@@ -427,7 +509,7 @@ private struct InspectorContent: View {
                 let known = Set(versions.map(\.id))
                 versions += result.items.filter { !known.contains($0.id) }
                 cursor = result.next
-            case .tasks, .events: break
+            case .permissions, .tags, .tasks, .events: break
             }
         } catch is CancellationError {} catch { self.error = error.localizedDescription }
     }
@@ -464,35 +546,6 @@ private struct InspectorContent: View {
         return sections
     }
 
-    private func permissions() async throws -> [DetailsSection] {
-        if target.object?.kind == .deleteMarker {
-            return [DetailsSection(title: "对象 ACL", note: "删除标记没有对象 ACL。")]
-        }
-        let isObject = target.object != nil
-        let result = try await client.fetch(isObject ? "get-object-acl" : "get-bucket-acl", args: target.objectArguments, requesterPays: isObject)
-        var entries: [DetailsRow] = []
-        if let owner = result.fields["Owner"] as? [String: String], let id = owner["ID"] {
-            entries.append(DetailsRow(name: "所有者", value: owner["DisplayName"].map { "\($0) · \(id)" } ?? id))
-        }
-        if let grants = result.fields["Grants"] as? [[String: Any]] {
-            for grant in grants {
-                let grantee = grant["Grantee"] as? [String: String] ?? [:]
-                let principal = [grantee["DisplayName"], grantee["ID"] ?? grantee["URI"] ?? grantee["EmailAddress"] ?? grantee["Type"]]
-                    .compactMap { $0 }.joined(separator: " · ")
-                entries.append(DetailsRow(name: grant["Permission"] as? String ?? "授权", value: principal))
-            }
-        }
-        var sections = [DetailsSection(title: isObject ? "对象 ACL" : "存储桶 ACL", rows: entries,
-                                       note: result.error ?? (entries.isEmpty ? "没有 ACL 条目。" : nil), error: result.error != nil)]
-        if !isObject {
-            sections += try await bucketSections([
-                ("get-public-access-block", "阻止公开访问"), ("get-bucket-policy-status", "策略公开状态"),
-                ("get-bucket-policy", "存储桶策略")
-            ])
-        }
-        return sections
-    }
-
     private func bucketSections(_ commands: [(String, String)]) async throws -> [DetailsSection] {
         var sections: [DetailsSection] = []
         for (command, title) in commands {
@@ -508,20 +561,6 @@ private struct InspectorContent: View {
                                            error: result.error != nil && !missing))
         }
         return sections
-    }
-
-    private func tags() async throws -> DetailsSection {
-        let title = target.object == nil ? "存储桶标签" : "对象标签"
-        if target.object?.kind == .deleteMarker { return DetailsSection(title: title, note: "删除标记没有对象标签。") }
-        let isObject = target.object != nil
-        let result = try await client.fetch(isObject ? "get-object-tagging" : "get-bucket-tagging", args: target.objectArguments, requesterPays: isObject)
-        let missing = result.error?.contains("(NoSuchTagSet)") == true
-        let entries = (result.fields["TagSet"] as? [[String: String]] ?? []).compactMap { tag -> DetailsRow? in
-            guard let key = tag["Key"], let value = tag["Value"] else { return nil }
-            return DetailsRow(name: key, value: value)
-        }
-        return DetailsSection(title: title, rows: entries, note: missing || (result.error == nil && entries.isEmpty) ? "暂无标签。" : result.error,
-                              error: result.error != nil && !missing)
     }
 
     private func rows(_ fields: [String: Any]) -> [DetailsRow] {

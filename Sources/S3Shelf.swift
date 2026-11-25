@@ -18,8 +18,25 @@ struct S3Shelf: App {
         .windowToolbarStyle(.unified)
 
         Settings {
-            AppearanceSettings(appearance: $appearance)
+            ShelfSettings(model: model, appearance: $appearance)
         }
+    }
+}
+
+struct ShelfSettings: View {
+    let model: Workspace
+    @Binding var appearance: ShelfAppearance
+
+    var body: some View {
+        TabView {
+            AppearanceSettings(appearance: $appearance)
+                .tabItem { Label("外观", systemImage: "circle.lefthalf.filled") }
+            InspectorCacheSettings(model: model)
+                .tabItem { Label("详情缓存", systemImage: "internaldrive") }
+        }
+        .frame(width: 480, height: 215)
+        .preferredColorScheme(appearance.colorScheme)
+        .onChange(of: appearance, initial: true) { _, value in value.apply() }
     }
 }
 
@@ -35,11 +52,51 @@ struct AppearanceSettings: View {
             }.pickerStyle(.segmented)
         }
         .formStyle(.grouped)
-        .fixedSize(horizontal: false, vertical: true)
-        .frame(width: 420)
-        .navigationTitle("外观")
-        .preferredColorScheme(appearance.colorScheme)
-        .onChange(of: appearance, initial: true) { _, value in value.apply() }
+    }
+}
+
+struct InspectorCacheSettings: View {
+    @ObservedObject var model: Workspace
+
+    var body: some View {
+        Form {
+            Section {
+                Picker("缓存时间", selection: lifetime) {
+                    ForEach(InspectorCachePolicy.lifetimes, id: \.self) { seconds in
+                        Text(lifetimeLabel(seconds)).tag(seconds)
+                    }
+                }
+                Picker("缓存空间上限", selection: capacity) {
+                    ForEach(InspectorCachePolicy.capacities, id: \.self) { kiB in
+                        Text(kiB >= 1024 ? "\(kiB / 1024) MiB" : "\(kiB) KiB").tag(kiB)
+                    }
+                }.disabled(model.inspectorCachePolicy.lifetimeSeconds == 0)
+            } footer: {
+                Text(model.inspectorCachePolicy.lifetimeSeconds == 0
+                     ? "每次加载标签、权限或响应头时都向服务端请求。"
+                     : "标签、权限和响应头共用内存缓存。到期后，下次查看会重新请求。空间按缓存记录估算。")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var lifetime: Binding<Int> {
+        Binding(get: { model.inspectorCachePolicy.lifetimeSeconds }, set: { seconds in
+            model.configureInspectorCache(.init(lifetimeSeconds: seconds, capacityKiB: model.inspectorCachePolicy.capacityKiB))
+        })
+    }
+
+    private var capacity: Binding<Int> {
+        Binding(get: { model.inspectorCachePolicy.capacityKiB }, set: { kiB in
+            model.configureInspectorCache(.init(lifetimeSeconds: model.inspectorCachePolicy.lifetimeSeconds, capacityKiB: kiB))
+        })
+    }
+
+    private func lifetimeLabel(_ seconds: Int) -> String {
+        if seconds == 0 { return "从不缓存" }
+        if seconds < 60 { return "\(seconds) 秒" }
+        return "\(seconds / 60) 分钟"
     }
 }
 
@@ -92,6 +149,7 @@ private struct Prompt: Identifiable {
     let message: String
     let action: () -> Void
     var destructive = true
+    var buttonTitle: String? = nil
 }
 
 private struct Notice: Identifiable {
@@ -106,10 +164,10 @@ struct ShelfWindow: View {
     @State private var confirmation: Prompt?
     @State private var notice: Notice?
     @State private var accessing = false
-    @State private var pathSheet = false
-    @State private var pathText = ""
     @State private var dropTarget = false
     @State private var manualBucket = false
+    @State private var createBucketConnection: Connection?
+    @State private var bucketDeletion: BucketDeletionRequest?
     @State private var bucketText = ""
     @State private var copying: S3Item?
     @State private var copyKey = ""
@@ -124,7 +182,8 @@ struct ShelfWindow: View {
             Group {
                 switch model.destination {
                 case .browse: browser
-                case .api: APIView(model: model) { confirmation = $0 }
+                case .api: APIView(model: model, confirm: { confirmation = $0 }, showBucketCreation: showBucketCreation,
+                                   showBucketDeletion: { bucketDeletion = $0 })
                 case .transfers: TransfersView(model: model)
                 }
             }
@@ -158,17 +217,11 @@ struct ShelfWindow: View {
             }
         }
         .sheet(item: $edit) { editor in ConnectionEditor(model: model, draft: editor.value, existing: editor.existing) }
-        .sheet(isPresented: $pathSheet) {
-            VStack(alignment: .leading, spacing: 18) {
-                Text("前往对象前缀").font(.title2.bold())
-                TextField("例如 images/2026/", text: $pathText).textFieldStyle(.roundedBorder)
-                    .font(.system(.body, design: .monospaced))
-                HStack {
-                    Spacer()
-                    Button("取消") { pathSheet = false }.keyboardShortcut(.cancelAction)
-                    Button("前往") { pathSheet = false; model.go(pathText) }.keyboardShortcut(.defaultAction)
-                }
-            }.padding(24).frame(width: 420)
+        .sheet(item: $createBucketConnection) { connection in
+            BucketCreationSheet(model: model, connection: connection)
+        }
+        .sheet(item: $bucketDeletion) { request in
+            BucketDeletionSheet(model: model, request: request)
         }
         .sheet(isPresented: $manualBucket) {
             VStack(alignment: .leading, spacing: 14) {
@@ -200,9 +253,10 @@ struct ShelfWindow: View {
             }.padding(25).frame(width: 470)
         }
         .alert(item: $confirmation) { prompt in
-            Alert(title: Text(prompt.title), message: Text(prompt.message),
-                  primaryButton: prompt.destructive ? .destructive(Text("确认"), action: prompt.action) : .default(Text("继续"), action: prompt.action),
-                  secondaryButton: .cancel(Text("取消")))
+            let label = Text(prompt.buttonTitle ?? (prompt.destructive ? "确认" : "继续"))
+            return Alert(title: Text(prompt.title), message: Text(prompt.message),
+                         primaryButton: prompt.destructive ? .destructive(label, action: prompt.action) : .default(label, action: prompt.action),
+                         secondaryButton: .cancel(Text("取消")))
         }
         .sheet(item: $notice) { notice in
             VStack(alignment: .leading, spacing: 13) {
@@ -216,78 +270,29 @@ struct ShelfWindow: View {
     }
 
     private var sidebar: some View {
-        List {
-            Section {
+        VStack(alignment: .leading, spacing: 13) {
+            VStack(alignment: .leading, spacing: 3) {
+                sidebarHeading("工作区")
                 sidebarRow("对象浏览", "tablecells", selected: model.destination == .browse) { model.destination = .browse }
                 sidebarRow("API 工作台", "chevron.left.forwardslash.chevron.right", selected: model.destination == .api) { model.destination = .api }
                 sidebarRow("传输队列", "arrow.up.arrow.down", selected: model.destination == .transfers,
-                           trailing: model.activeTransfers == 0 ? nil : String(model.activeTransfers)) { model.destination = .transfers }
-            } header: {
-                Text("工作区").foregroundStyle(Color(nsColor: .secondaryLabelColor))
-            }
-            Section {
-                if model.connections.isEmpty {
-                    sidebarRow("AWS 默认配置", "person.crop.circle", selected: model.connection?.name == "AWS 默认配置") {
-                        var local = Connection()
-                        local.name = "AWS 默认配置"
-                        model.connect(local)
+                           trailing: model.activeTransfers == 0 ? nil : String(model.activeTransfers),
+                           showsActivity: model.hasRunningTransfers) { model.destination = .transfers }
+                SettingsLink {
+                    Label {
+                        Text("配置")
+                    } icon: {
+                        Image(systemName: "gearshape")
+                            .frame(width: 17)
+                            .foregroundStyle(Color(nsColor: .secondaryLabelColor))
                     }
-                }
-                ForEach(model.connections) { connection in
-                    sidebarRow(connection.name, connection.endpoint.isEmpty ? "cloud" : "server.rack",
-                               selected: connection.id == model.connection?.id) { model.connect(connection) }
-                    .contextMenu {
-                        Button("编辑连接") { edit = ConnectionEdit(value: connection, existing: true) }
-                        if connection.auth == .profile {
-                            Button("IAM Identity Center 登录") { login(connection) }
-                        }
-                        Divider()
-                        Button("移除连接", role: .destructive) {
-                            confirmation = Prompt(title: "移除连接？", message: connection.name) {
-                                do { try model.removeConnection(connection) }
-                                catch { notice = Notice(title: "无法移除连接", body: error.localizedDescription) }
-                            }
-                        }
-                    }
-                }
-            } header: {
-                HStack {
-                    Text("连接").foregroundStyle(Color(nsColor: .secondaryLabelColor))
-                    Spacer()
-                    Button { edit = ConnectionEdit(value: Connection(), existing: false) } label: {
-                        Image(systemName: "plus")
-                    }.buttonStyle(.borderless).help("新建连接").accessibilityLabel("新建连接")
-                }
-            }
-            Section {
-                if let bucket = model.bucket, !model.buckets.contains(where: { $0.id == bucket.id }) { bucketRow(bucket) }
-                ForEach(model.buckets.sorted { $0.Name.localizedStandardCompare($1.Name) == .orderedAscending }) { bucketRow($0) }
-                if model.bucketCursor != nil {
-                    Button("加载更多存储桶") { model.listBuckets(more: true) }.buttonStyle(.link)
-                }
-                if let error = model.bucketError {
-                    Button { notice = Notice(title: "无法列出存储桶", body: error) } label: {
-                        Label("查看连接错误", systemImage: "exclamationmark.circle").foregroundStyle(Color(nsColor: .systemOrange))
-                    }.buttonStyle(.plain)
-                }
-            } header: {
-                HStack(spacing: 8) {
-                    Text("存储桶").foregroundStyle(Color(nsColor: .secondaryLabelColor))
-                    Spacer()
-                    if model.busyBuckets { ProgressView().controlSize(.mini) }
-                    Menu {
-                        Button("刷新存储桶", systemImage: "arrow.clockwise") { model.listBuckets() }
-                        Button("按名称或 ARN 打开", systemImage: "arrow.up.right.square") { bucketText = ""; manualBucket = true }
-                        Button("创建存储桶", systemImage: "plus") { model.shortcut("create-bucket") }.disabled(!model.canWrite)
-                    } label: {
-                        Image(systemName: "ellipsis.circle")
-                    }.menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-                        .disabled(model.connection == nil).help("存储桶操作").accessibilityLabel("存储桶操作")
-                }
-            }
-        }
-        .listStyle(.sidebar)
-        .safeAreaInset(edge: .bottom, spacing: 0) {
+                    .padding(.horizontal, 7)
+                    .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+                    .contentShape(Rectangle())
+                }.buttonStyle(.plain).help("打开软件配置").accessibilityIdentifier("app-configuration")
+            }.padding(.horizontal, 10)
+            connectionsPane
+            bucketsPane
             if let connection = model.connection {
                 VStack(spacing: 0) {
                     Divider()
@@ -303,9 +308,110 @@ struct ShelfWindow: View {
                 }.background(.bar)
             }
         }
+        .padding(.top, 9)
+        .background(.regularMaterial)
     }
 
-    private func sidebarRow(_ title: String, _ symbol: String, selected: Bool, trailing: String? = nil, action: @escaping () -> Void) -> some View {
+    private var connectionsPane: some View {
+        let rowCount = min(max(model.connections.count, 1), 5)
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                sidebarHeading("连接")
+                Spacer()
+                Button { edit = ConnectionEdit(value: Connection(), existing: false) } label: {
+                    Image(systemName: "plus")
+                }.buttonStyle(.borderless).help("新建连接").accessibilityLabel("新建连接")
+            }.padding(.trailing, 15)
+            ScrollView {
+                LazyVStack(spacing: 4) {
+                    if model.connections.isEmpty {
+                        sidebarRow("AWS 默认配置", "person.crop.circle", selected: model.connection?.name == "AWS 默认配置") {
+                            var local = Connection()
+                            local.name = "AWS 默认配置"
+                            model.connect(local)
+                        }
+                    }
+                    ForEach(model.connections) { connection in
+                        sidebarRow(connection.name, connection.endpoint.isEmpty ? "cloud" : "server.rack",
+                                   selected: connection.id == model.connection?.id) { model.connect(connection) }
+                        .contextMenu {
+                            Button("编辑连接") { edit = ConnectionEdit(value: connection, existing: true) }
+                            if connection.auth == .profile {
+                                Button("IAM Identity Center 登录") { login(connection) }
+                            }
+                            Divider()
+                            Button("移除连接", role: .destructive) {
+                                confirmation = Prompt(title: "移除连接？", message: connection.name) {
+                                    do { try model.removeConnection(connection) }
+                                    catch { notice = Notice(title: "无法移除连接", body: error.localizedDescription) }
+                                }
+                            }
+                        }
+                    }
+                }.padding(.horizontal, 10)
+            }
+            .frame(height: CGFloat(rowCount * 32 - 4))
+            .scrollIndicators(.visible)
+            .accessibilityLabel("连接清单")
+        }
+    }
+
+    private var bucketsPane: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                sidebarHeading("存储桶")
+                Spacer()
+                if model.busyBuckets { ProgressView().controlSize(.mini) }
+                Button(action: showBucketCreation) {
+                    Image(systemName: "plus")
+                }.buttonStyle(.borderless)
+                    .disabled(!model.canCreateBucket)
+                    .help(model.connection?.auth == .anonymous ? "匿名连接无法创建存储桶" : "创建存储桶")
+                    .accessibilityLabel("创建存储桶")
+                    .accessibilityIdentifier("sidebar-create-bucket")
+                Menu {
+                    Button("刷新存储桶", systemImage: "arrow.clockwise") { model.listBuckets() }
+                    Button("按名称或 ARN 打开", systemImage: "arrow.up.right.square") { bucketText = ""; manualBucket = true }
+                    Button("创建存储桶", systemImage: "plus", action: showBucketCreation).disabled(!model.canCreateBucket)
+                    if let bucket = model.bucket {
+                        Divider()
+                        Button("删除当前存储桶…", systemImage: "trash", role: .destructive) { showBucketDeletion(bucket) }
+                            .disabled(!model.canDelete(bucket))
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }.menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                    .disabled(model.connection == nil).help("存储桶操作").accessibilityLabel("存储桶操作")
+            }.padding(.trailing, 15)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 4) {
+                    if let bucket = model.bucket, !model.buckets.contains(where: { $0.id == bucket.id }) { bucketRow(bucket) }
+                    ForEach(model.buckets.sorted { $0.Name.localizedStandardCompare($1.Name) == .orderedAscending }) { bucketRow($0) }
+                    if model.bucketCursor != nil {
+                        Button("加载更多存储桶") { model.listBuckets(more: true) }.buttonStyle(.link).disabled(model.busyBuckets)
+                            .padding(7)
+                    }
+                    if let error = model.bucketError {
+                        Button { notice = Notice(title: "无法列出存储桶", body: error) } label: {
+                            Label("查看连接错误", systemImage: "exclamationmark.circle").foregroundStyle(Color(nsColor: .systemOrange))
+                        }.buttonStyle(.plain).padding(7)
+                    }
+                }.padding(.horizontal, 10).padding(.bottom, 5)
+            }
+            .id(model.connection?.id)
+            .frame(maxHeight: .infinity)
+            .scrollIndicators(.visible)
+            .accessibilityLabel("存储桶清单")
+        }
+    }
+
+    private func sidebarHeading(_ title: String) -> some View {
+        Text(title).font(.caption.weight(.semibold)).foregroundStyle(Color(nsColor: .secondaryLabelColor))
+            .padding(.leading, 17).accessibilityAddTraits(.isHeader)
+    }
+
+    private func sidebarRow(_ title: String, _ symbol: String, selected: Bool, trailing: String? = nil,
+                            showsActivity: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 8) {
                 Image(systemName: symbol)
@@ -314,6 +420,7 @@ struct ShelfWindow: View {
                 Text(title).foregroundStyle(Color(nsColor: .labelColor))
                     .fontWeight(selected ? .semibold : .regular).lineLimit(1).truncationMode(.middle)
                 Spacer(minLength: 0)
+                if showsActivity { TransferActivityIndicator() }
                 if let trailing { Text(trailing).font(.caption.monospacedDigit()).foregroundStyle(Color(nsColor: .secondaryLabelColor)) }
             }.padding(.horizontal, 7).frame(minHeight: 28).contentShape(Rectangle())
                 .background(selected ? Color(nsColor: .unemphasizedSelectedContentBackgroundColor) : .clear,
@@ -323,6 +430,10 @@ struct ShelfWindow: View {
 
     private func bucketRow(_ bucket: Bucket) -> some View {
         sidebarRow(bucket.Name, "shippingbox", selected: model.bucket?.id == bucket.id && model.destination == .browse) { model.openBucket(bucket) }
+            .contextMenu {
+                Button("删除存储桶…", systemImage: "trash", role: .destructive) { showBucketDeletion(bucket) }
+                    .disabled(!model.canDelete(bucket))
+            }
     }
 
     @ViewBuilder private var browser: some View {
@@ -350,21 +461,18 @@ struct ShelfWindow: View {
                         Button("对象锁定") { model.shortcut("get-object-lock-configuration") }
                         Button("CORS") { model.shortcut("get-bucket-cors") }
                         Button("存储桶标签") { model.shortcut("get-bucket-tagging") }
+                        Divider()
+                        Button("删除存储桶…", systemImage: "trash", role: .destructive) { showBucketDeletion(bucket) }
+                            .disabled(!model.canDelete(bucket))
                     } label: { Label("存储桶设置", systemImage: "slider.horizontal.3") }.fixedSize()
                 }.padding(.horizontal, 20).padding(.top, 15).padding(.bottom, 13)
                 HStack(spacing: 10) {
                     Button {
-                        let parent = model.prefix.dropLast(model.prefix.hasSuffix("/") ? 1 : 0)
-                        model.go(parent.lastIndex(of: "/").map { String(parent[...$0]) } ?? "")
+                        model.go(ObjectPath.levels(in: model.prefix).dropLast().last?.prefix ?? "")
                     } label: { Image(systemName: "arrow.up") }.disabled(model.prefix.isEmpty).help("上一级")
                     Button { model.list() } label: { Image(systemName: "arrow.clockwise") }.keyboardShortcut("r", modifiers: .command).help("刷新")
-                    Button { pathText = model.prefix; pathSheet = true } label: {
-                        HStack(spacing: 7) {
-                            Image(systemName: "folder").foregroundStyle(.secondary)
-                            Text("/" + model.prefix).font(.system(.callout, design: .monospaced)).lineLimit(1).truncationMode(.middle)
-                            Spacer(minLength: 0)
-                        }
-                    }.help("前往对象前缀")
+                    PathBar(prefix: model.prefix, navigate: openPath)
+                        .id("\(model.connection?.id.uuidString ?? "")/\(bucket.id)")
                     FilterField("筛选已加载对象", text: $model.search).frame(width: 170)
                     Toggle("版本", isOn: Binding(get: { model.versions }, set: { model.setVersions($0) })).toggleStyle(.checkbox)
                 }.padding(.horizontal, 20).padding(.bottom, 11)
@@ -480,6 +588,12 @@ struct ShelfWindow: View {
                             .onSubmit { openEnteredBucket() }
                         Button("打开") { openEnteredBucket() }.buttonStyle(.borderedProminent)
                     }
+                    if model.canWrite {
+                        Button("创建存储桶", action: showBucketCreation).disabled(!model.canCreateBucket)
+                    } else {
+                        Text("匿名连接可浏览有访问权限的存储桶。创建存储桶需要登录。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     if let error = model.bucketError {
                         Button("查看存储桶列表错误") { notice = Notice(title: "无法列出存储桶", body: error) }.buttonStyle(.link)
                     }
@@ -500,6 +614,25 @@ struct ShelfWindow: View {
         guard !name.isEmpty else { return }
         model.openBucket(Bucket(Name: name))
         bucketText = ""
+    }
+
+    private func showBucketCreation() {
+        guard model.canCreateBucket, let connection = model.connection else { return }
+        model.resetBucketCreation()
+        createBucketConnection = connection
+    }
+
+    private func showBucketDeletion(_ bucket: Bucket) {
+        bucketDeletion = model.bucketDeletionRequest(for: bucket)
+    }
+
+    private func openPath(_ path: ObjectPath) {
+        if let name = path.bucket, name != model.bucket?.Name {
+            let destination = model.buckets.first { $0.Name == name } ?? Bucket(Name: name)
+            model.openBucket(destination, prefix: path.prefix)
+        } else {
+            model.go(path.prefix)
+        }
     }
 
     private func sync(upload: Bool) {
@@ -553,8 +686,10 @@ struct ShelfWindow: View {
     private func openInspector(_ tab: InspectorTab, item: S3Item) {
         model.selected = [item.id]
         inspectorTab = tab
-        if let bucket = model.bucket, let connection = model.currentConnection {
+        if tab.needsRequest, tab.cacheKinds.isEmpty, let bucket = model.bucket, let connection = model.currentConnection {
             inspectorRequest = InspectorTarget(connectionID: connection.id, bucket: bucket, item: item, prefix: model.prefix)
+        } else {
+            inspectorRequest = nil
         }
         showInspector = true
     }
@@ -728,6 +863,8 @@ private struct ConnectionEditor: View {
 private struct APIView: View {
     @ObservedObject var model: Workspace
     let confirm: (Prompt) -> Void
+    let showBucketCreation: () -> Void
+    let showBucketDeletion: (BucketDeletionRequest) -> Void
     @State private var service = "s3api"
     @State private var filter = ""
 
@@ -776,6 +913,18 @@ private struct APIView: View {
                             Button("AWS 文档") { openDocumentation(operation) }.buttonStyle(.link)
                         }
                         if !operation.summary.isEmpty { Text(operation.summary).font(.callout).foregroundStyle(.secondary).lineLimit(3) }
+                        if operation.createsBucket {
+                            HStack {
+                                Text("常规创建可在表单中填写存储桶名称和目标位置。")
+                                    .font(.callout).foregroundStyle(.secondary)
+                                Spacer()
+                                Button("打开创建表单", action: showBucketCreation).buttonStyle(.link).disabled(!model.canCreateBucket)
+                            }
+                        }
+                        if model.connection == nil || operation.mutates && !model.canWrite {
+                            Text(model.connection == nil ? "请从侧栏选择目标连接后执行。" : "匿名连接无法执行写入操作。")
+                                .font(.callout).foregroundStyle(.secondary)
+                        }
                         HStack {
                             Text("请求 JSON").font(.subheadline.weight(.semibold))
                             Spacer()
@@ -789,10 +938,13 @@ private struct APIView: View {
                                 }.fixedSize().disabled(model.apiBusy)
                             }
                         }
-                        TextEditor(text: $model.parameters)
-                            .font(.system(.body, design: .monospaced))
-                            .scrollContentBackground(.hidden).padding(6)
+                        JSONRequestEditor(text: $model.parameters)
+                            .padding(6)
                             .frame(minHeight: 85).modifier(CodeSurface()).disabled(model.apiBusy)
+                        if let requestError = model.apiRequestError {
+                            Label(requestError, systemImage: "exclamationmark.circle")
+                                .font(.callout).foregroundStyle(.orange).textSelection(.enabled)
+                        }
                         if !operation.required.isEmpty {
                             Text("必填  " + operation.required.joined(separator: " · ")).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                         }
@@ -811,13 +963,13 @@ private struct APIView: View {
                             Text("响应").font(.subheadline.weight(.semibold))
                             if model.apiBusy { ProgressView().controlSize(.small) }
                             Spacer()
-                            if model.apiBusy { Button("取消") { model.cancelAPI() } }
-                            Button("复制") { copy(model.apiResult) }.disabled(model.apiResult.isEmpty)
-                            Button("执行") {
-                                if operation.mutates {
-                                    confirm(Prompt(title: "执行 \(operation.name)？", message: "此操作可能修改 AWS 资源。请核对请求参数和连接。", action: model.execute))
-                                } else { model.execute() }
-                            }.buttonStyle(.borderedProminent).disabled(model.apiBusy || model.connection == nil || operation.mutates && !model.canWrite)
+                            if model.apiBusy { Button("停止等待") { model.cancelAPI() } }
+                            Button("复制") { copy(model.apiResult) }.disabled(model.apiResult.isEmpty || model.apiBusy)
+                            Button(operation.deletesBucket ? "确认删除…" : "执行") { execute(operation) }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(model.apiBusy || model.bucketDeletionRunning || model.connection == nil ||
+                                          operation.mutates && !model.canWrite || operation.createsBucket && !model.canCreateBucket ||
+                                          operation.deletesBucket && !model.canDeleteBucket)
                         }
                         HStack {
                             Toggle("自动分页", isOn: $model.apiPaginate).toggleStyle(.checkbox)
@@ -837,6 +989,21 @@ private struct APIView: View {
         }
         .onAppear { if let operation = model.operation { service = operation.service } }
         .onChange(of: model.operation?.id) { _, _ in if let operation = model.operation { service = operation.service } }
+    }
+
+    private func execute(_ operation: Operation) {
+        if operation.deletesBucket {
+            if let request = model.workbenchBucketDeletionRequest() { showBucketDeletion(request) }
+            return
+        }
+        guard let connection = model.connection, let request = model.validatedAPIRequest() else { return }
+        if operation.createsBucket, let name = request["Bucket"] as? String {
+            confirm(Prompt(title: "创建存储桶「\(name)」？", message: "目标连接「\(connection.name)」。",
+                           action: model.execute, destructive: false, buttonTitle: "创建"))
+        } else if operation.mutates {
+            confirm(Prompt(title: "执行 \(operation.name)？",
+                           message: "此操作可能修改「\(connection.name)」中的资源。请核对请求参数。", action: model.execute))
+        } else { model.execute() }
     }
 
     private func openDocumentation(_ operation: Operation) {
@@ -899,7 +1066,10 @@ struct TransfersView: View {
                                     }
                                 }
                                 Spacer(minLength: 8)
-                                Text(transfer.status.rawValue).font(.callout).foregroundStyle(transfer.status == .failed ? Color.red : .secondary)
+                                HStack(spacing: 6) {
+                                    if transfer.status == .running { TransferActivityIndicator() }
+                                    Text(transfer.status.rawValue).font(.callout).foregroundStyle(transfer.status == .failed ? Color.red : .secondary)
+                                }
                                 if transfer.status == .running || transfer.status == .queued {
                                     Button("取消") { model.cancel(transfer.id) }
                                 }
@@ -913,6 +1083,15 @@ struct TransfersView: View {
                 }
             }
         }
+    }
+}
+
+private struct TransferActivityIndicator: View {
+    var body: some View {
+        ProgressView()
+            .progressViewStyle(.circular)
+            .controlSize(.mini)
+            .accessibilityLabel("传输中")
     }
 }
 

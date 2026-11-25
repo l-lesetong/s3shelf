@@ -94,28 +94,54 @@ enum Keychain {
 typealias OutputHandler = @Sendable (String) -> Void
 typealias ResponseHandler = @Sendable (S3HTTPResponse) -> Void
 
+final class ResponseCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var response: S3HTTPResponse?
+    func set(_ response: S3HTTPResponse) { lock.withLock { self.response = response } }
+    func get() -> S3HTTPResponse? { lock.withLock { response } }
+}
+
 struct S3HTTPResponse: Sendable {
     let status: Int?
     let url: String?
     let headers: [String: String]
+    var sdkStatus: Int? = nil
+    var errorCode: String?
+    var errorRequestID: String?
+
+    var operationStatus: Int? { sdkStatus ?? status }
 
     var requestID: String? {
-        headers.first { $0.key.lowercased() == "x-amz-request-id" }?.value
+        header("x-amz-request-id") ?? errorRequestID
     }
 
-    static func parse(_ diagnostics: String) -> Self? {
+    func header(_ name: String) -> String? {
+        headers.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
+    }
+
+    static func parse(_ diagnostics: String, includeErrorCode: Bool = false) -> Self? {
         var status: Int?
         var url: String?
+        var sdkStatus: Int?
         var response: Self?
+        var expectingErrorBody = false
         let pattern = #""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'"#
         let pairs = try! NSRegularExpression(pattern: "(\(pattern))\\s*:\\s*(\(pattern))")
         for line in diagnostics.split(whereSeparator: \.isNewline) {
+            if expectingErrorBody {
+                if let error = errorFields(from: line) {
+                    response?.errorCode = error.code
+                    response?.errorRequestID = error.requestID
+                }
+                expectingErrorBody = false
+            }
             if let logger = line.range(of: " - urllib3.connectionpool - DEBUG - "),
                let boundary = line.range(of: #" HTTP/\d(?:\.\d)?["'] "#, options: .regularExpression),
                logger.upperBound <= boundary.lowerBound {
                 status = Int(line[boundary.upperBound...].prefix(3))
                 let request = line[logger.upperBound..<boundary.lowerBound].split(separator: " ", maxSplits: 2)
                 url = nil
+                sdkStatus = nil
                 if request.count == 3 {
                     let path = request[2].prefix { $0 != "?" }
                     if path.hasPrefix("/"), var address = URLComponents(string: "\(request[0])\(path)"),
@@ -127,6 +153,14 @@ struct S3HTTPResponse: Sendable {
                         url = address.string
                     }
                 }
+            }
+            // Botocore can promote an HTTP 200 with an invalid or error body to a service error.
+            if line.contains(" - botocore.handlers - DEBUG - Error found for response with 200 status code: ") {
+                sdkStatus = 500
+            }
+            if includeErrorCode, let status = response?.operationStatus, (400..<600).contains(status),
+               line.hasSuffix(" - botocore.parsers - DEBUG - Response body:") {
+                expectingErrorBody = true
             }
             let marker = " - botocore.parsers - DEBUG - Response headers: "
             guard let start = line.range(of: marker) else { continue }
@@ -142,9 +176,26 @@ struct S3HTTPResponse: Sendable {
                         "x-amz-server-side-encryption-customer-key"].contains(canonical) else { continue }
                 headers[name] = unquote(raw[value])
             }
-            response = Self(status: status, url: url, headers: headers)
+            response = Self(status: status, url: url, headers: headers, sdkStatus: sdkStatus)
         }
         return response
+    }
+
+    private static func errorFields(from line: Substring) -> (code: String?, requestID: String?)? {
+        guard line.utf8.count <= 65_536, line.first == "b",
+              let quote = line.dropFirst().first, quote == "'" || quote == "\"", line.last == quote else { return nil }
+        let body = unquote(line.dropFirst())
+        let bytes = body.unicodeScalars.compactMap { UInt8(exactly: $0.value) }
+        guard bytes.count == body.unicodeScalars.count, let xml = String(bytes: bytes, encoding: .utf8),
+              !xml.contains("<!DOCTYPE"),
+              let document = try? XMLDocument(data: Data(bytes), options: [.nodeLoadExternalEntitiesNever]),
+              let root = document.rootElement(), root.localName == "Error" else { return nil }
+        let elements = root.children?.compactMap { $0 as? XMLElement } ?? []
+        var code = elements.first { $0.localName == "Code" }?.stringValue
+        if code?.range(of: #"^[A-Za-z][A-Za-z0-9]{0,63}$"#, options: .regularExpression) == nil { code = nil }
+        var requestID = elements.first { $0.localName?.lowercased() == "requestid" }?.stringValue
+        if requestID?.range(of: #"^[A-Za-z0-9+_.:/=-]{1,256}$"#, options: .regularExpression) == nil { requestID = nil }
+        return (code, requestID)
     }
 
     private static func unquote(_ literal: Substring) -> String {
@@ -184,12 +235,24 @@ private final class Child: @unchecked Sendable {
     }
 
     func run(_ executable: URL, _ arguments: [String], _ environment: [String: String],
-             _ progress: OutputHandler?, response: ResponseHandler? = nil) throws -> Data {
+             _ progress: OutputHandler?, response: ResponseHandler? = nil, captureServiceErrors: Bool = false,
+             literalObjectKey: String? = nil) throws -> Data {
         let output = Pipe()
         let errors = Pipe()
         let errorData = ErrorBuffer()
-        process.executableURL = executable
-        process.arguments = arguments
+        if let literalObjectKey {
+            // Pass ASCII through Foundation, then restore the key bytes before replacing the shell with the CLI.
+            let launch = """
+                key=$(printf '%s' "$1" | /usr/bin/base64 -D && printf '.') || exit 1
+                shift
+                exec "$@" "--key=${key%.}"
+                """
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = ["-c", launch, "s3Shelf", Data(literalObjectKey.utf8).base64EncodedString(), executable.path] + arguments
+        } else {
+            process.executableURL = executable
+            process.arguments = arguments
+        }
         process.environment = environment
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = output
@@ -220,9 +283,20 @@ private final class Child: @unchecked Sendable {
         drains.wait()
         if lock.withLock({ cancelled }) { throw CancellationError() }
         let diagnostics = String(decoding: errorData.data, as: UTF8.self)
-        if let response, let received = S3HTTPResponse.parse(diagnostics) { response(received) }
+        let received = response != nil || captureServiceErrors && process.terminationStatus != 0
+            ? S3HTTPResponse.parse(diagnostics, includeErrorCode: captureServiceErrors) : nil
+        if let received { response?(received) }
         if process.terminationStatus != 0 {
-            let message = response == nil
+            // An empty S3 error message can make the AWS CLI S3 error formatter throw
+            // before it reports the service's original error code.
+            if captureServiceErrors, diagnostics.contains("awscli/customizations/s3errormsg.py"),
+               diagnostics.contains("TypeError: argument of type 'NoneType'"),
+               let code = received?.errorCode, let status = received?.operationStatus {
+                let requestID = received?.requestID.map { "，请求 ID \($0)" } ?? ""
+                let statusLabel = received?.sdkStatus == nil ? "HTTP \(status)" : "AWS CLI 处理状态 \(status)"
+                throw ShelfError("S3 操作失败 (\(code))，\(statusLabel)\(requestID)。")
+            }
+            let message = response == nil && !captureServiceErrors
                 ? diagnostics.trimmingCharacters(in: .whitespacesAndNewlines)
                 : diagnostics.split(whereSeparator: \.isNewline).last(where: { $0.hasPrefix("aws: [ERROR]:") }).map(String.init) ?? ""
             throw ShelfError(message.isEmpty ? "AWS CLI 退出状态码 \(process.terminationStatus)。" : message)
@@ -234,6 +308,14 @@ private final class Child: @unchecked Sendable {
 }
 
 enum Engine {
+    private static let commandsWithServiceErrors: Set<String> = [
+        "create-bucket", "delete-bucket",
+        "get-bucket-acl", "get-object-acl", "put-bucket-acl", "put-object-acl",
+        "get-bucket-policy", "put-bucket-policy", "delete-bucket-policy", "get-bucket-policy-status",
+        "get-public-access-block", "put-public-access-block", "delete-public-access-block",
+        "get-bucket-ownership-controls", "put-bucket-ownership-controls", "delete-bucket-ownership-controls"
+    ]
+
     static func executable() throws -> URL {
         guard let resources = Bundle.main.resourceURL else { throw ShelfError("找不到应用资源。") }
         let bundled = resources.appendingPathComponent("aws-cli/aws")
@@ -256,14 +338,20 @@ enum Engine {
 
     static func run(_ arguments: [String], connection: Connection? = nil, endpointOverride: Bool = true,
                     inputJSON: Data? = nil,
+                    literalObjectKey: String? = nil,
+                    maxAttempts: Int? = nil,
                     response: ResponseHandler? = nil,
                     progress: OutputHandler? = nil) async throws -> Data {
         let child = Child()
         return try await withTaskCancellationHandler {
             try await Task.detached(priority: .userInitiated) {
                 var environment = profileEnvironment()
+                if let maxAttempts { environment["AWS_MAX_ATTEMPTS"] = String(maxAttempts) }
                 var flags = ["--no-cli-pager", "--no-cli-auto-prompt"]
-                if response != nil { flags.append("--debug") }
+                let subcommand = arguments.dropFirst().first ?? ""
+                let captureServiceErrors = arguments.first == "s3api" &&
+                    (subcommand.hasSuffix("-tagging") || commandsWithServiceErrors.contains(subcommand))
+                if response != nil || captureServiceErrors { flags.append("--debug") }
                 var temporary: URL?
                 defer { if let temporary { try? FileManager.default.removeItem(at: temporary) } }
                 if inputJSON != nil || connection?.auth == .keys || connection?.pathStyle == true {
@@ -323,7 +411,8 @@ enum Engine {
                         environment["AWS_SECURITY_TOKEN"] = nil
                     }
                 }
-                return try child.run(executable(), flags + command, environment, progress, response: response)
+                return try child.run(executable(), flags + command, environment, progress,
+                                     response: response, captureServiceErrors: captureServiceErrors, literalObjectKey: literalObjectKey)
             }.value
         } onCancel: { child.stop() }
     }
