@@ -45,7 +45,3 @@ open build/s3Shelf.app
 | `catalog.py` | 根据 AWS CLI 服务模型生成 API 工作台命令目录 |
 | `Tools/rclone-s3/` | 构建内置 S3 传输辅助程序 |
 | `build.sh` | 生成通用架构的 `s3Shelf.app` |
-
-## 提交约定
-
-提交格式为 `type(scope): 中文主题`。主题用简短的中文动词开头，末尾省略句号。首次克隆后可运行 `git config --local commit.template .gitmessage` 载入模板。
