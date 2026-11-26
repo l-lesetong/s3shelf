@@ -109,8 +109,8 @@ struct ObjectPage: Decodable {
     }
 }
 
-struct Transfer: Identifiable {
-    enum Status: String { case queued = "排队中", running = "传输中", done = "完成", failed = "失败", cancelled = "已取消" }
+struct Transfer: Identifiable, Codable {
+    enum Status: String, Codable { case queued = "排队中", running = "传输中", done = "完成", failed = "失败", cancelled = "已取消" }
     var id = UUID()
     let title: String
     let arguments: [String]
@@ -119,11 +119,27 @@ struct Transfer: Identifiable {
     var output: URL?
     var staging: URL?
     var change: ObjectChange?
+    var remote: RemoteTransferJob?
+    var remoteStats: RemoteTransferStats?
     var status = Status.queued
     var detail = ""
+
+    func conflicts(with other: Self) -> Bool {
+        if let remote, let peer = other.remote {
+            return remote.destination.overlaps(peer.destination) || remote.destination.overlaps(peer.source) ||
+                remote.source.overlaps(peer.destination)
+        }
+        if let remote { return other.writes(to: remote.source) || other.writes(to: remote.destination) }
+        if let peer = other.remote { return writes(to: peer.source) || writes(to: peer.destination) }
+        return false
+    }
+
+    private func writes(to location: RemoteTransferLocation) -> Bool {
+        connection.id == location.connection.id && change?.affects(bucket: location.bucket, prefix: location.prefix) == true
+    }
 }
 
-struct ObjectChange {
+struct ObjectChange: Codable {
     let bucket: String
     var key: String?
     var recursive = false
@@ -138,6 +154,12 @@ struct ObjectChange {
 @MainActor
 final class Workspace: ObservableObject {
     enum Destination: Hashable { case browse, api, transfers }
+    struct BrowserLocation: Equatable {
+        let connectionRevision: UUID
+        let bucket: String?
+        let prefix: Data
+        let versions: Bool
+    }
     private struct ListingScope: Hashable {
         let bucket: String
         let prefixBytes: Data
@@ -158,7 +180,18 @@ final class Workspace: ObservableObject {
         let pageCount: Int
     }
 
-    @Published var destination = Destination.browse
+    @Published private var windowDestination = Destination.browse
+    var destination: Destination {
+        get { transferQueue.windowDestination }
+        set {
+            let owner = transferQueue
+            guard owner.windowDestination != newValue else { return }
+            owner.windowDestination = newValue
+            if newValue == .browse {
+                for pane in owner.openPanes { pane.scheduleListingRefresh() }
+            }
+        }
+    }
     @Published var connections: [Connection] = []
     @Published var connection: Connection?
     @Published var buckets: [Bucket] = []
@@ -196,6 +229,7 @@ final class Workspace: ObservableObject {
     @Published private(set) var hasMoreObjects = false
     @Published private(set) var needsListingRefresh = false
     @Published private(set) var inspectorCachePolicy: InspectorCachePolicy
+    @Published private(set) var transferPreferences: TransferPreferences
     private var filteredItems: [S3Item] = []
     private var itemIndices: [String: Int] = [:]
     private var activeListing: ListingScope?
@@ -213,25 +247,101 @@ final class Workspace: ObservableObject {
     private var apiTask: Task<Void, Never>?
     private var apiCreatingBucket = false
     private var transferTasks: [UUID: Task<Void, Never>] = [:]
+    private var transferAttempts: [UUID: UUID] = [:]
+    private var globallyLimitedTransfer: UUID?
     private var listGeneration = UUID()
     private var bucketGeneration = UUID()
-    private(set) var inspectorCache: InspectorCache
+    private(set) var connectionRevision = UUID()
+    let inspectorCache: InspectorCache
     let operations: [Operation]
     private let defaults: UserDefaults
     private let templates: [String: [String: Any]]
+    private let windowWorkspace: Workspace?
+    private let additionalPanes = NSHashTable<Workspace>.weakObjects()
+    private let implicitConnection: Connection = {
+        var connection = Connection()
+        connection.name = "AWS 默认配置"
+        return connection
+    }()
+
+    var transferQueue: Workspace { windowWorkspace ?? self }
+    var defaultConnection: Connection { transferQueue.implicitConnection }
+    private var openPanes: [Workspace] { [self] + additionalPanes.allObjects }
 
     init(defaults: UserDefaults = .standard) {
+        windowWorkspace = nil
         self.defaults = defaults
         let policy = InspectorCachePolicy(defaults: defaults)
         inspectorCachePolicy = policy
         inspectorCache = InspectorCache(policy: policy)
+        transferPreferences = TransferPreferences(defaults: defaults)
         let catalog = Operation.load()
         operations = catalog.operations
         templates = catalog.templates
         if let data = defaults.data(forKey: "connections"), let saved = try? JSONDecoder().decode([Connection].self, from: data) {
             connections = saved
         }
+        if let data = defaults.data(forKey: "remoteTransferHistory"), let saved = try? JSONDecoder().decode([Transfer].self, from: data) {
+            transfers = saved.map {
+                var transfer = $0
+                if transfer.status == .running || transfer.status == .queued {
+                    transfer.status = .cancelled
+                    transfer.detail = "应用已退出，可以重新提交。"
+                }
+                return transfer
+            }
+        }
     }
+
+    private init(windowWorkspace: Workspace) {
+        self.windowWorkspace = windowWorkspace
+        defaults = windowWorkspace.defaults
+        inspectorCache = windowWorkspace.inspectorCache
+        inspectorCachePolicy = windowWorkspace.inspectorCachePolicy
+        transferPreferences = windowWorkspace.transferPreferences
+        operations = windowWorkspace.operations
+        templates = windowWorkspace.templates
+        connections = windowWorkspace.connections
+    }
+
+    func duplicateBrowser() -> Workspace {
+        let owner = transferQueue
+        let pane = Workspace(windowWorkspace: owner)
+        owner.additionalPanes.add(pane)
+        pane.connection = connection
+        pane.buckets = buckets
+        pane.bucketCursor = bucketCursor
+        pane.bucketError = bucketError
+        pane.bucket = bucket
+        pane.prefix = prefix
+        pane.versions = versions
+        pane.activeListing = activeListing
+        if !busy, error == nil, !needsListingRefresh, isFresh(firstPageLoadedAt) {
+            pane.items = items
+            pane.itemIndices = itemIndices
+            pane.firstPageLoadedAt = firstPageLoadedAt
+            pane.loadedPages = loadedPages
+            pane.visitedCursors = visitedCursors
+            pane.setNextPage(nextPage)
+        } else if let activeListing {
+            pane.requestPage(activeListing, cursor: nil)
+        }
+        if busyBuckets && buckets.isEmpty { pane.listBuckets() }
+        return pane
+    }
+
+    func closeBrowser() {
+        transferQueue.additionalPanes.remove(self)
+        apiTask?.cancel()
+        resetConnection(nil)
+    }
+
+    var browserLocation: BrowserLocation {
+        BrowserLocation(connectionRevision: connectionRevision, bucket: bucket?.Name,
+                        prefix: Data(prefix.utf8), versions: versions)
+    }
+
+    func matches(_ location: BrowserLocation) -> Bool { browserLocation == location }
 
     var currentConnection: Connection? {
         guard var connection else { return nil }
@@ -257,46 +367,92 @@ final class Workspace: ObservableObject {
     var hasRunningTransfers: Bool { transfers.contains { $0.status == .running } }
 
     func save(_ value: Connection, credentials: Credentials?) throws {
+        let owner = transferQueue
         if let credentials { try Keychain.save(credentials, for: value.id) }
-        if value.auth != .keys, connections.contains(where: { $0.id == value.id && $0.auth == .keys }) { try Keychain.remove(value.id) }
-        if let index = connections.firstIndex(where: { $0.id == value.id }) { connections[index] = value }
-        else { connections.append(value) }
-        UserDefaults.standard.set(try JSONEncoder().encode(connections), forKey: "connections")
+        var updated = owner.connections
+        if value.auth != .keys, updated.contains(where: { $0.id == value.id && $0.auth == .keys }) { try Keychain.remove(value.id) }
+        if let index = updated.firstIndex(where: { $0.id == value.id }) { updated[index] = value }
+        else { updated.append(value) }
+        defaults.set(try JSONEncoder().encode(updated), forKey: "connections")
+        inspectorCache.invalidate(connectionID: value.id)
+        for pane in owner.openPanes { pane.connections = updated }
+        for pane in owner.openPanes where pane !== self && pane.connection?.id == value.id {
+            pane.reloadConnection(value)
+        }
         connect(value)
     }
 
     func removeConnection(_ value: Connection) throws {
         if value.auth == .keys { try Keychain.remove(value.id) }
-        connections.removeAll { $0.id == value.id }
-        UserDefaults.standard.set(try JSONEncoder().encode(connections), forKey: "connections")
-        if value.id == connection?.id { connect(nil) }
+        let owner = transferQueue
+        let updated = owner.connections.filter { $0.id != value.id }
+        defaults.set(try JSONEncoder().encode(updated), forKey: "connections")
+        inspectorCache.invalidate(connectionID: value.id)
+        for pane in owner.openPanes {
+            pane.connections = updated
+            if value.id == pane.connection?.id { pane.resetConnection(nil) }
+        }
     }
 
     func configureInspectorCache(_ policy: InspectorCachePolicy) {
+        if let windowWorkspace { windowWorkspace.configureInspectorCache(policy); return }
         guard policy != inspectorCachePolicy else { return }
         inspectorCache.configure(policy)
-        inspectorCachePolicy = policy
+        for pane in openPanes { pane.inspectorCachePolicy = policy }
         policy.save(to: defaults)
     }
 
+    func configureTransfers(_ preferences: TransferPreferences) {
+        if let windowWorkspace { windowWorkspace.configureTransfers(preferences); return }
+        guard preferences != transferPreferences else { return }
+        for pane in openPanes { pane.transferPreferences = preferences }
+        preferences.save(to: defaults)
+        startTransfers()
+    }
+
     func connect(_ value: Connection?) {
+        resetConnection(value)
+        destination = .browse
+        let initial = value?.bucket ?? ""
+        openBucket(initial.isEmpty ? nil : Bucket(Name: initial))
+        if value != nil && initial.isEmpty { listBuckets() }
+    }
+
+    func reloadAuthenticatedConnection(_ value: Connection) {
+        inspectorCache.invalidate(connectionID: value.id)
+        for pane in transferQueue.openPanes where pane.connection == value {
+            pane.reloadConnection(value)
+        }
+    }
+
+    private func reloadConnection(_ value: Connection) {
+        let openBucket = bucket
+        let openPrefix = prefix
+        let showVersions = versions
+        resetConnection(value)
+        bucket = openBucket.map { Bucket(Name: $0.Name) }
+        navigate(to: openPrefix, versions: showVersions)
+        if value.bucket.isEmpty { listBuckets() }
+    }
+
+    private func resetConnection(_ value: Connection?) {
         bucketTask?.cancel()
         resetListing()
         activeListing = nil
         listingCache.removeAll()
-        inspectorCache = InspectorCache(policy: inspectorCachePolicy)
+        connectionRevision = UUID()
         bucketGeneration = UUID()
         busyBuckets = false
         bucketsAddedWhileListing = []
         bucketsRemovedWhileListing = []
         connection = value
+        bucket = nil
+        prefix = ""
+        versions = false
+        search = ""
         buckets = []
         bucketCursor = nil
         bucketError = nil
-        destination = .browse
-        let initial = value?.bucket ?? ""
-        openBucket(initial.isEmpty ? nil : Bucket(Name: initial))
-        if value != nil && initial.isEmpty { listBuckets() }
     }
 
     func listBuckets(more: Bool = false) {
@@ -339,7 +495,7 @@ final class Workspace: ObservableObject {
         }
     }
 
-    private static func loadBucketPage(_ connection: Connection, cursor: String?) async throws -> Buckets {
+    static func loadBucketPage(_ connection: Connection, cursor: String?) async throws -> Buckets {
         let base = ["s3api", "list-buckets", "--no-paginate"]
         var arguments = base + ["--max-buckets=1000"]
         if let cursor { arguments.append("--continuation-token=\(cursor)") }
@@ -460,7 +616,13 @@ final class Workspace: ObservableObject {
         let command = scope.versions ? "list-object-versions" : "list-objects-v2"
         let prefix = scope.prefix
         listingTask = Task {
-            defer { if generation == listGeneration { busy = false; listingTask = nil } }
+            defer {
+                if generation == listGeneration {
+                    busy = false
+                    listingTask = nil
+                    scheduleListingRefresh()
+                }
+            }
             do {
                 var args = ["s3api", command, "--bucket=\(scope.bucket)", "--prefix=\(prefix)",
                             "--delimiter=/", "--max-keys=1000", "--no-paginate"] + payer(connection)
@@ -492,8 +654,14 @@ final class Workspace: ObservableObject {
     }
 
     private func invalidateListings(_ changes: [ObjectChange], connectionID: UUID) {
-        guard connection?.id == connectionID, !changes.isEmpty else { return }
-        inspectorCache.invalidate(changes: changes)
+        guard !changes.isEmpty else { return }
+        inspectorCache.invalidate(changes: changes, connectionID: connectionID)
+        for pane in transferQueue.openPanes where pane.connection?.id == connectionID {
+            pane.invalidateListingPages(changes)
+        }
+    }
+
+    private func invalidateListingPages(_ changes: [ObjectChange]) {
         func affected(_ scope: ListingScope) -> Bool {
             let prefix = scope.prefix
             return changes.contains { $0.affects(bucket: scope.bucket, prefix: prefix) }
@@ -509,7 +677,7 @@ final class Workspace: ObservableObject {
         refreshTask?.cancel()
         guard destination == .browse, loadedPages <= 1, !busy else { return }
         let prefix = activeListing.prefix
-        let writesPending = transfers.contains {
+        let writesPending = transferQueue.transfers.contains {
             ($0.status == .running || $0.status == .queued) && $0.connection.id == connectionID &&
             $0.change?.affects(bucket: activeListing.bucket, prefix: prefix) == true
         }
@@ -673,7 +841,10 @@ final class Workspace: ObservableObject {
     }
 
     private func addCreatedBucket(_ bucket: Bucket, connection: Connection) {
-        guard self.connection == connection else { return }
+        for pane in transferQueue.openPanes where pane.connection == connection { pane.insertBucket(bucket) }
+    }
+
+    private func insertBucket(_ bucket: Bucket) {
         if let index = buckets.firstIndex(where: { $0.Name == bucket.Name }) {
             if buckets[index].BucketRegion == nil, bucket.BucketRegion != nil { buckets[index] = bucket }
         } else { buckets.append(bucket) }
@@ -854,21 +1025,25 @@ final class Workspace: ObservableObject {
         let http = capture.get()
         record(S3Event(action: request.operation, resource: request.resource, success: result.removed,
                        requestID: http?.requestID ?? http?.header("x-request-id"), status: http?.status))
-        if result.removed, request.isS3Bucket, connection == request.connection {
-            let name = request.name
-            buckets.removeAll { $0.Name == name }
-            bucketsAddedWhileListing.removeAll { $0.Name == name }
-            if busyBuckets { bucketsRemovedWhileListing.insert(name) }
-            if bucket?.Name == name || bucket?.Name == request.resource {
-                let currentDestination = destination
-                openBucket(nil)
-                destination = currentDestination
+        if result.removed, request.isS3Bucket {
+            for pane in transferQueue.openPanes where pane.connection == request.connection {
+                pane.removeBucket(request.name, resource: request.resource)
             }
-            listingCache = listingCache.filter { $0.key.bucket != name }
-            inspectorCache.invalidate(changes: [ObjectChange(bucket: name)])
+            inspectorCache.invalidate(changes: [ObjectChange(bucket: request.name)], connectionID: request.connection.id)
         }
         if request.fromWorkbench { apiResult = result.text }
         return result
+    }
+
+    private func removeBucket(_ name: String, resource: String) {
+        if bucket?.Name == name || bucket?.Name == resource {
+            bucket = nil
+            navigate(to: "", versions: false)
+        }
+        buckets.removeAll { $0.Name == name }
+        bucketsAddedWhileListing.removeAll { $0.Name == name }
+        if busyBuckets { bucketsRemovedWhileListing.insert(name) }
+        listingCache = listingCache.filter { $0.key.bucket != name && $0.key.bucket != resource }
     }
 
     private static func bucketDeletionFailure(_ request: BucketDeletionRequest, response: S3HTTPResponse?,
@@ -972,7 +1147,8 @@ final class Workspace: ObservableObject {
                     apiBusy = false
                     if let stage { try? FileManager.default.removeItem(at: stage) }
                     if operation.service == "s3api", operation.mutates, let bucket = object["Bucket"] as? String {
-                        details.invalidateMutation(operation.name, change: ObjectChange(bucket: bucket, key: object["Key"] as? String))
+                        details.invalidateMutation(operation.name, change: ObjectChange(bucket: bucket, key: object["Key"] as? String),
+                                                   connectionID: connection.id)
                     }
                 }
                 do {
@@ -1130,13 +1306,49 @@ final class Workspace: ObservableObject {
         }
     }
 
-    func enqueue(_ transfer: Transfer) { transfers.insert(transfer, at: 0); startTransfers() }
+    func enqueue(_ transfer: Transfer) {
+        let queue = transferQueue
+        queue.transfers.insert(transfer, at: 0)
+        queue.startTransfers()
+    }
+
+    func enqueueRemote(_ job: RemoteTransferJob) throws {
+        if let windowWorkspace { try windowWorkspace.enqueueRemote(job); return }
+        try job.validate()
+        try validateTransferConnections(job)
+        transfers.insert(.init(title: "S3 → S3 · \(job.mode.title)", arguments: [], connection: job.destination.connection,
+                               streaming: false, change: ObjectChange(bucket: job.destination.bucket,
+                                                                      key: job.destination.prefix, recursive: true),
+                               remote: job), at: 0)
+        saveRemoteTransferHistory()
+        startTransfers()
+    }
+
+    private func validateTransferConnections(_ job: RemoteTransferJob) throws {
+        for connection in [job.source.connection, job.destination.connection] {
+            if connections.first(where: { $0.id == connection.id }) == connection || self.connection == connection { continue }
+            if connection.auth == .profile, connection.name == "AWS 默认配置", connection.endpoint.isEmpty,
+               connection.profile.isEmpty { continue }
+            throw ShelfError("连接「\(connection.name)」已变更。请按当前配置重新建立传输任务。")
+        }
+    }
+
+    private func saveRemoteTransferHistory() {
+        let remote = transfers.lazy.filter { $0.remote != nil }
+        let records = remote.reduce(into: [Transfer]()) { history, transfer in
+            if history.count < 100 || transfer.status == .queued || transfer.status == .running { history.append(transfer) }
+        }
+        if let data = try? JSONEncoder().encode(records) { defaults.set(data, forKey: "remoteTransferHistory") }
+    }
 
     func cancel(_ id: UUID) {
         if let task = transferTasks[id] { task.cancel() }
         else if let index = transfers.firstIndex(where: { $0.id == id && $0.status == .queued }) {
             transfers[index].status = .cancelled
-            if transfers[index].change != nil { scheduleListingRefresh() }
+            if transfers[index].remote != nil { saveRemoteTransferHistory() }
+            if transfers[index].change != nil {
+                for pane in openPanes { pane.scheduleListingRefresh() }
+            }
         }
     }
 
@@ -1144,35 +1356,69 @@ final class Workspace: ObservableObject {
         guard let index = transfers.firstIndex(where: { $0.id == id }), [.failed, .cancelled].contains(transfers[index].status) else { return }
         transfers[index].status = .queued
         transfers[index].detail = ""
+        transfers[index].remoteStats = nil
+        if transfers[index].remote != nil { saveRemoteTransferHistory() }
         startTransfers()
     }
 
     private func startTransfers() {
-        while transferTasks.count < 3, let index = transfers.lastIndex(where: { $0.status == .queued }) {
+        let preferences = transferPreferences
+        let limited = preferences.bytesPerSecond != nil
+        guard globallyLimitedTransfer == nil else { return }
+        while transferTasks.count < (limited ? 1 : 3) {
+            let running = transfers.filter { $0.status == .running }
+            guard let index = transfers.lastIndex(where: { candidate in
+                candidate.status == .queued && !running.contains(where: { candidate.conflicts(with: $0) })
+            }) else { return }
             transfers[index].status = .running
             let job = transfers[index]
+            if limited { globallyLimitedTransfer = job.id }
+            let attempt = UUID()
+            transferAttempts[job.id] = attempt
+            if job.remote != nil { saveRemoteTransferHistory() }
             transferTasks[job.id] = Task { [self] in
+                let remoteLog = job.remote.map { _ in RcloneLog() }
                 defer {
                     if let staging = job.staging { try? FileManager.default.removeItem(at: staging) }
+                    if let stats = remoteLog?.stats, let index = transfers.firstIndex(where: { $0.id == job.id }) {
+                        transfers[index].remoteStats = stats
+                    }
+                    if job.remote != nil { saveRemoteTransferHistory() }
+                    transferAttempts[job.id] = nil
                     transferTasks[job.id] = nil
+                    if globallyLimitedTransfer == job.id { globallyLimitedTransfer = nil }
                     startTransfers()
                     if let change = job.change {
                         if change.recursive || transfers.first(where: { $0.id == job.id })?.status == .done {
                             invalidateListings([change], connectionID: job.connection.id)
                         } else {
-                            scheduleListingRefresh()
+                            for pane in openPanes { pane.scheduleListingRefresh() }
                         }
                     }
                 }
                 do {
+                    if let remote = job.remote, let remoteLog {
+                        try validateTransferConnections(remote)
+                        try await RcloneEngine.run(remote, preferences: preferences, log: remoteLog) { [weak self] stats in
+                            Task { @MainActor in
+                                guard let self, self.transferAttempts[job.id] == attempt,
+                                      let index = self.transfers.firstIndex(where: { $0.id == job.id && $0.status == .running }) else { return }
+                                self.transfers[index].remoteStats = stats
+                            }
+                        }
+                        try Task.checkCancellation()
+                        updateTransfer(job.id, status: .done)
+                        return
+                    }
                     let progress: OutputHandler = { [weak self] line in
                         Task { @MainActor in
-                            guard let self, let index = self.transfers.firstIndex(where: { $0.id == job.id }),
+                            guard let self, self.transferAttempts[job.id] == attempt,
+                                  let index = self.transfers.firstIndex(where: { $0.id == job.id }),
                                   self.transfers[index].status == .running else { return }
                             self.transfers[index].detail = line
                         }
                     }
-                    _ = try await Engine.run(job.arguments, connection: job.connection, progress: job.streaming ? progress : nil)
+                    try await runTransfer(job, preferences: preferences, progress: progress)
                     try Task.checkCancellation()
                     if let stage = job.staging, let output = job.output {
                         try Self.finalizeDownload(stage, to: output)
@@ -1182,6 +1428,25 @@ final class Workspace: ObservableObject {
                 catch { updateTransfer(job.id, status: .failed, detail: error.localizedDescription) }
             }
         }
+    }
+
+    private func runTransfer(_ job: Transfer, preferences: TransferPreferences, progress: @escaping OutputHandler) async throws {
+        var arguments = job.arguments
+        var settings: [String: String] = [:]
+        var throttledDownload: (file: URL, bytesPerSecond: Int64)?
+        if arguments.first == "s3" {
+            if job.change != nil { settings["multipart_chunksize"] = "\(preferences.partMiB)MB" }
+            if let limit = preferences.bytesPerSecond { settings["max_bandwidth"] = "\(limit)B/s" }
+            if !settings.isEmpty { settings["preferred_transfer_client"] = "classic" }
+        } else if let stage = job.staging, let limit = preferences.bytesPerSecond,
+                  arguments.starts(with: ["s3api", "get-object"]), let output = arguments.firstIndex(of: stage.path) {
+            // The low-level version download bypasses the high-level CLI transfer manager.
+            arguments[output] = "/dev/stdout"
+            arguments.append("--output=off")
+            throttledDownload = (stage, limit)
+        }
+        _ = try await Engine.run(arguments, connection: job.connection, transferSettings: settings,
+                                 throttledDownload: throttledDownload, progress: job.streaming ? progress : nil)
     }
 
     private func updateTransfer(_ id: UUID, status: Transfer.Status, detail: String? = nil) {

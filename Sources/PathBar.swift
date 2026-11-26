@@ -58,6 +58,7 @@ struct ObjectPath {
 
 struct PathBar: View {
     let prefix: String
+    var active = true
     let navigate: (ObjectPath) -> Void
     @State private var editing = false
     @State private var draft = ""
@@ -87,7 +88,7 @@ struct PathBar: View {
                                 Image(systemName: "pencil").font(.caption).foregroundStyle(.secondary)
                             }.padding(.trailing, 8).frame(minWidth: 34, maxWidth: .infinity, minHeight: 26).contentShape(Rectangle())
                         }
-                        .buttonStyle(.plain).keyboardShortcut("l", modifiers: .command)
+                        .buttonStyle(.plain).keyboardShortcut(active ? KeyboardShortcut("l", modifiers: .command) : nil)
                         .accessibilityLabel("编辑路径").help("编辑路径（⌘L）")
                     }
                     .padding(.leading, 4)

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">s3Shelf · 归档抽屉</title>
+  <path fill="#282631" d="M128 16 C170 16 193 16 212 31 C237 50 240 72 240 128 C240 184 237 206 212 225 C193 240 170 240 128 240 C86 240 63 240 44 225 C19 206 16 184 16 128 C16 72 19 50 44 31 C63 16 86 16 128 16 Z" />
+  <path fill="#B97755" d="M158 101.87 L208 73 V154 Q208 163 202 169 L172 199 L158 180 Z" />
+  <path fill="#F1BD8F" d="M48 98 L83 63 Q88 58 96 58 H192 Q208 58 208 73 V78 L176 110 H53 Z" />
+  <path fill="#FFE9D4" fill-rule="evenodd" d="M61 93 H162 Q177 93 177 108 V184 Q177 199 162 199 H61 Q46 199 46 184 V108 Q46 93 61 93 Z M88 131 H135 A10 10 0 0 1 135 151 H88 A10 10 0 0 1 88 131 Z" />
+</svg>

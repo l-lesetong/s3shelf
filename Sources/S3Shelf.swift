@@ -33,8 +33,10 @@ struct ShelfSettings: View {
                 .tabItem { Label("外观", systemImage: "circle.lefthalf.filled") }
             InspectorCacheSettings(model: model)
                 .tabItem { Label("详情缓存", systemImage: "internaldrive") }
+            TransferSettings(model: model)
+                .tabItem { Label("传输", systemImage: "arrow.up.arrow.down") }
         }
-        .frame(width: 480, height: 215)
+        .frame(width: 500, height: 255)
         .preferredColorScheme(appearance.colorScheme)
         .onChange(of: appearance, initial: true) { _, value in value.apply() }
     }
@@ -159,21 +161,25 @@ private struct Notice: Identifiable {
 }
 
 struct ShelfWindow: View {
-    @ObservedObject var model: Workspace
+    @ObservedObject private var windowWorkspace: Workspace
+    @StateObject private var layout: BrowserPanes
+    private var model: Workspace { layout.active.model }
     @State private var edit: ConnectionEdit?
     @State private var confirmation: Prompt?
     @State private var notice: Notice?
     @State private var accessing = false
-    @State private var dropTarget = false
     @State private var manualBucket = false
     @State private var createBucketConnection: Connection?
     @State private var bucketDeletion: BucketDeletionRequest?
+    @State private var remoteTransfer: RemoteTransferForm?
     @State private var bucketText = ""
-    @State private var copying: S3Item?
+    @State private var copying: ObjectCopyPrompt?
     @State private var copyKey = ""
-    @State private var showInspector = true
-    @State private var inspectorTab = InspectorTab.properties
-    @State private var inspectorRequest: InspectorTarget?
+
+    init(model: Workspace) {
+        _windowWorkspace = ObservedObject(wrappedValue: model)
+        _layout = StateObject(wrappedValue: BrowserPanes(model: model))
+    }
 
     var body: some View {
         NavigationSplitView {
@@ -181,35 +187,31 @@ struct ShelfWindow: View {
         } detail: {
             Group {
                 switch model.destination {
-                case .browse: browser
+                case .browse: browserPanes
                 case .api: APIView(model: model, confirm: { confirmation = $0 }, showBucketCreation: showBucketCreation,
-                                   showBucketDeletion: { bucketDeletion = $0 })
-                case .transfers: TransfersView(model: model)
+                                   showBucketDeletion: { bucketDeletion = $0 }).id(layout.active.id)
+                case .transfers: TransfersView(model: windowWorkspace)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(nsColor: .windowBackgroundColor))
         }
         .navigationSplitViewStyle(.balanced)
-        .onChange(of: model.destination) { _, destination in
-            if destination != .browse { inspectorRequest = nil }
-        }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                if model.destination == .browse {
+                    splitMenu.accessibilityIdentifier("browser-split")
+                }
                 if model.destination == .browse, model.bucket != nil {
-                    Button { upload() } label: {
+                    Button { upload(in: model) } label: {
                         Label("上传", systemImage: "square.and.arrow.up")
                     }.disabled(!model.canWrite).help("上传文件或文件夹")
-                    Button { if let item = model.selection.first { download(item) } } label: {
+                    Button { if let item = model.selection.first { download(item, in: model) } } label: {
                         Label("下载", systemImage: "square.and.arrow.down")
                     }.disabled(model.selection.count != 1 || model.selection.first?.kind == .deleteMarker).help("下载所选对象")
-                    Button {
-                        showInspector.toggle()
-                        if !showInspector { inspectorRequest = nil }
-                    } label: {
-                        Label(showInspector ? "隐藏详情" : "显示详情", systemImage: "rectangle.bottomthird.inset.filled")
-                    }.keyboardShortcut("i", modifiers: [.command, .option])
-                        .help(showInspector ? "隐藏详情" : "显示详情")
+                    InspectorToggle(state: layout.active.inspector)
+                        .keyboardShortcut("i", modifiers: [.command, .option])
+                        .accessibilityIdentifier("toolbar-inspector-toggle")
                 }
                 Button { edit = ConnectionEdit(value: Connection(), existing: false) } label: {
                     Label("新建连接", systemImage: "plus.circle")
@@ -223,6 +225,9 @@ struct ShelfWindow: View {
         .sheet(item: $bucketDeletion) { request in
             BucketDeletionSheet(model: model, request: request)
         }
+        .sheet(item: $remoteTransfer) { form in
+            RemoteTransferSheet(model: windowWorkspace, form: form)
+        }
         .sheet(isPresented: $manualBucket) {
             VStack(alignment: .leading, spacing: 14) {
                 Text("打开存储桶").font(.title2.bold())
@@ -235,7 +240,8 @@ struct ShelfWindow: View {
                 }
             }.padding(24).frame(width: 430)
         }
-        .sheet(item: $copying) { item in
+        .sheet(item: $copying) { request in
+            let item = request.item
             VStack(alignment: .leading, spacing: 12) {
                 SectionHeading(title: "在存储桶内复制", subtitle: item.key)
                 TextField("目标对象键", text: $copyKey).textFieldStyle(.roundedBorder)
@@ -246,7 +252,7 @@ struct ShelfWindow: View {
                         let target = copyKey
                         copying = nil
                         confirmation = Prompt(title: "复制对象？", message: "如果目标对象已存在，S3 将按存储桶的版本设置处理覆盖。") {
-                            model.copyObject(item, to: target)
+                            atLocation(request.location, in: request.model) { request.model.copyObject(item, to: target) }
                         }
                     }.keyboardShortcut(.defaultAction).disabled(copyKey.isEmpty || copyKey == item.key)
                 }
@@ -269,15 +275,40 @@ struct ShelfWindow: View {
         }
     }
 
+    private var splitMenu: some View {
+        Menu {
+            Button("左右分屏", systemImage: "rectangle.split.2x1") { layout.split(.horizontal) }
+                .disabled(!layout.canSplit(.horizontal))
+            Button("上下分屏", systemImage: "rectangle.split.1x2") { layout.split(.vertical) }
+                .disabled(!layout.canSplit(.vertical))
+            if layout.isSplit {
+                Divider()
+                Button("关闭当前窗格", systemImage: "xmark") { layout.close(layout.active) }
+            }
+        } label: {
+            Label("分屏", systemImage: "rectangle.split.2x2")
+        }.help("分屏浏览，最多同时打开四个窗格")
+    }
+
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 13) {
             VStack(alignment: .leading, spacing: 3) {
-                sidebarHeading("工作区")
+                HStack {
+                    sidebarHeading("工作区")
+                    Spacer()
+                    if model.destination == .browse {
+                        splitMenu
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                            .font(.caption)
+                            .accessibilityIdentifier("sidebar-browser-split")
+                    }
+                }.padding(.trailing, 5).frame(height: 20)
                 sidebarRow("对象浏览", "tablecells", selected: model.destination == .browse) { model.destination = .browse }
                 sidebarRow("API 工作台", "chevron.left.forwardslash.chevron.right", selected: model.destination == .api) { model.destination = .api }
                 sidebarRow("传输队列", "arrow.up.arrow.down", selected: model.destination == .transfers,
-                           trailing: model.activeTransfers == 0 ? nil : String(model.activeTransfers),
-                           showsActivity: model.hasRunningTransfers) { model.destination = .transfers }
+                           trailing: windowWorkspace.activeTransfers == 0 ? nil : String(windowWorkspace.activeTransfers),
+                           showsActivity: windowWorkspace.hasRunningTransfers) { model.destination = .transfers }
                 SettingsLink {
                     Label {
                         Text("配置")
@@ -326,9 +357,7 @@ struct ShelfWindow: View {
                 LazyVStack(spacing: 4) {
                     if model.connections.isEmpty {
                         sidebarRow("AWS 默认配置", "person.crop.circle", selected: model.connection?.name == "AWS 默认配置") {
-                            var local = Connection()
-                            local.name = "AWS 默认配置"
-                            model.connect(local)
+                            model.connect(windowWorkspace.defaultConnection)
                         }
                     }
                     ForEach(model.connections) { connection in
@@ -398,7 +427,7 @@ struct ShelfWindow: View {
                     }
                 }.padding(.horizontal, 10).padding(.bottom, 5)
             }
-            .id(model.connection?.id)
+            .id(model.connectionRevision)
             .frame(maxHeight: .infinity)
             .scrollIndicators(.visible)
             .accessibilityLabel("存储桶清单")
@@ -429,184 +458,46 @@ struct ShelfWindow: View {
     }
 
     private func bucketRow(_ bucket: Bucket) -> some View {
-        sidebarRow(bucket.Name, "shippingbox", selected: model.bucket?.id == bucket.id && model.destination == .browse) { model.openBucket(bucket) }
+        let pane = layout.active
+        let revision = pane.model.connectionRevision
+        return sidebarRow(bucket.Name, "shippingbox", selected: model.bucket?.id == bucket.id && model.destination == .browse) {
+            guard layout.active.id == pane.id, pane.model.connectionRevision == revision else { return }
+            pane.model.openBucket(bucket)
+        }
             .contextMenu {
                 Button("删除存储桶…", systemImage: "trash", role: .destructive) { showBucketDeletion(bucket) }
                     .disabled(!model.canDelete(bucket))
             }
     }
 
-    @ViewBuilder private var browser: some View {
-        if let bucket = model.bucket {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(alignment: .center) {
-                    SectionHeading(title: bucket.Name, subtitle: bucket.BucketRegion ?? model.currentConnection.flatMap { $0.region.isEmpty ? nil : $0.region } ?? "Amazon S3")
-                    Spacer(minLength: 12)
-                    if model.busy { ProgressView().controlSize(.small).accessibilityLabel("正在加载对象") }
-                    Menu {
-                        Button("删除所选对象", systemImage: "trash", role: .destructive) { confirmDelete(model.selection) }
-                            .disabled(!model.canWrite || model.selection.isEmpty || model.selection.contains(where: { $0.kind == .folder }))
-                        Menu("同步", systemImage: "arrow.triangle.2.circlepath") {
-                            Button("本地文件夹 → S3") { sync(upload: true) }.disabled(!model.canWrite)
-                            Button("S3 → 本地文件夹") { sync(upload: false) }
-                        }
-                    } label: { Label("对象操作", systemImage: "ellipsis.circle") }.fixedSize()
-                    Menu {
-                        Button("版本控制") { model.shortcut("get-bucket-versioning") }
-                        Button("生命周期") { model.shortcut("get-bucket-lifecycle-configuration") }
-                        Button("存储桶策略") { model.shortcut("get-bucket-policy") }
-                        Button("默认加密") { model.shortcut("get-bucket-encryption") }
-                        Button("阻止公开访问") { model.shortcut("get-public-access-block") }
-                        Button("跨区域复制") { model.shortcut("get-bucket-replication") }
-                        Button("对象锁定") { model.shortcut("get-object-lock-configuration") }
-                        Button("CORS") { model.shortcut("get-bucket-cors") }
-                        Button("存储桶标签") { model.shortcut("get-bucket-tagging") }
-                        Divider()
-                        Button("删除存储桶…", systemImage: "trash", role: .destructive) { showBucketDeletion(bucket) }
-                            .disabled(!model.canDelete(bucket))
-                    } label: { Label("存储桶设置", systemImage: "slider.horizontal.3") }.fixedSize()
-                }.padding(.horizontal, 20).padding(.top, 15).padding(.bottom, 13)
-                HStack(spacing: 10) {
-                    Button {
-                        model.go(ObjectPath.levels(in: model.prefix).dropLast().last?.prefix ?? "")
-                    } label: { Image(systemName: "arrow.up") }.disabled(model.prefix.isEmpty).help("上一级")
-                    Button { model.list() } label: { Image(systemName: "arrow.clockwise") }.keyboardShortcut("r", modifiers: .command).help("刷新")
-                    PathBar(prefix: model.prefix, navigate: openPath)
-                        .id("\(model.connection?.id.uuidString ?? "")/\(bucket.id)")
-                    FilterField("筛选已加载对象", text: $model.search).frame(width: 170)
-                    Toggle("版本", isOn: Binding(get: { model.versions }, set: { model.setVersions($0) })).toggleStyle(.checkbox)
-                }.padding(.horizontal, 20).padding(.bottom, 11)
-                Divider()
-                if let error = model.error {
-                    HStack(alignment: .top, spacing: 10) {
-                        Image(systemName: "exclamationmark.circle").foregroundStyle(.orange)
-                        ScrollView { Text(error).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 84)
-                        Button("重试") { model.list(more: model.hasMoreObjects && !model.needsListingRefresh) }.disabled(model.busy)
-                    }.padding(12)
-                    Divider()
-                }
-                VSplitView {
-                    Table(model.visibleItems, selection: $model.selected) {
-                        TableColumn("名称") { item in
-                            Label {
-                                Text(display(item)).lineLimit(1).truncationMode(.middle)
-                            } icon: { Image(systemName: item.icon).foregroundStyle(item.kind == .folder ? Color.accentColor : Color.secondary) }
-                        }.width(min: 160, ideal: 310)
-                        TableColumn("大小") { item in
-                            Text(item.size.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "—")
-                                .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
-                        }.width(min: 70, ideal: 85)
-                        TableColumn("存储类别") { item in Text(item.storage ?? "—").foregroundStyle(.secondary).lineLimit(1) }.width(min: 85, ideal: 110)
-                        TableColumn("更新时间") { item in
-                            Text(item.date.map { String($0.prefix(19)).replacingOccurrences(of: "T", with: " ") + " UTC" } ?? "—")
-                                .font(.caption.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)
-                        }.width(min: 130, ideal: 150)
-                    }.contextMenu(forSelectionType: String.self) { selected in
-                        let items = model.selectedItems(selected)
-                        if let item = items.first, items.count == 1 {
-                            if item.kind == .folder { Button("打开文件夹") { model.go(item.key) } }
-                            if item.kind != .deleteMarker {
-                                Button("下载到…") { download(item) }
-                            }
-                            if item.kind == .object || item.kind == .version {
-                                Button("对象属性") { openInspector(.properties, item: item) }
-                                Button("对象标签") { openInspector(.tags, item: item) }
-                                Button("对象 ACL") { openInspector(.permissions, item: item) }
-                                Button("预览") { openInspector(.preview, item: item) }
-                                Button("恢复归档对象") { itemAPI("restore-object", item) }.disabled(!model.canWrite)
-                                if item.kind == .object {
-                                    Button("复制到同一存储桶…") { copyKey = item.key; copying = item }.disabled(!model.canWrite)
-                                    Button("复制预签名下载链接") { presign(item) }.disabled(!model.canWrite)
-                                }
-                            }
-                            Button("复制对象键") { copy(item.key) }
-                            if let version = item.version { Button("复制版本 ID") { copy(version) } }
-                            Button("复制 S3 URI") { copy(Engine.s3URI(bucket.Name, item.key)) }
-                        }
-                        if model.canWrite && !items.isEmpty && items.allSatisfy({ $0.kind != .folder }) {
-                            Divider()
-                            Button("删除", role: .destructive) { confirmDelete(items) }
-                        }
-                    } primaryAction: { selected in
-                        guard selected.count == 1, let item = model.selectedItems(selected).first else { return }
-                        if item.kind == .folder { model.go(item.key) }
-                        else { openInspector(.properties, item: item) }
-                    }
-                    .overlay {
-                        if model.visibleItems.isEmpty && !model.busy && model.error == nil {
-                            ContentUnavailableView(model.search.isEmpty ? "此处没有对象" : "没有匹配的对象",
-                                                   systemImage: model.search.isEmpty ? "tray" : "magnifyingglass")
-                                .controlSize(.small).allowsHitTesting(false)
-                        }
-                    }
-                    .frame(minHeight: 110)
-                    if showInspector, let connection = model.currentConnection {
-                        let selected = model.selection
-                        let target = InspectorTarget(connectionID: connection.id, bucket: bucket,
-                                                     item: selected.count == 1 ? selected.first : nil, prefix: model.prefix)
-                        InspectorPane(model: model, target: target, tab: $inspectorTab, requestedTarget: $inspectorRequest, download: download)
-                            .frame(minHeight: 130, idealHeight: 253)
-                    }
-                }
-                Divider()
-                HStack {
-                    Text(model.search.isEmpty ? "已加载 \(model.items.count) 项" : "已加载的 \(model.items.count) 项中匹配 \(model.visibleItems.count) 项")
-                    if !model.selection.isEmpty { Text("· 已选 \(model.selection.count) 项") }
-                    Spacer()
-                    if model.needsListingRefresh {
-                        Button("清单有更新 · 刷新") { model.list() }.disabled(model.busy)
-                    } else if model.hasMoreObjects {
-                        Button("加载下一页") { model.list(more: true) }.disabled(model.busy)
-                    }
-                }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, 20).frame(height: 35)
-                    .background(.bar)
-            }.dropDestination(for: URL.self) { urls, _ in
-                guard model.canWrite, urls.contains(where: \.isFileURL) else { return false }
-                model.upload(urls)
-                return true
-            } isTargeted: { dropTarget = $0 && model.canWrite }
-            .overlay { if dropTarget { RoundedRectangle(cornerRadius: 9).strokeBorder(Color.accentColor, lineWidth: 3).allowsHitTesting(false) } }
-        } else {
-            ContentUnavailableView {
-                if model.connection == nil {
-                    VStack(spacing: 12) {
-                        Image(nsImage: NSApp.applicationIconImage).resizable().scaledToFit()
-                            .frame(width: 72, height: 72).accessibilityHidden(true)
-                        Text("连接到对象存储")
-                    }
-                } else {
-                    Label("打开存储桶", systemImage: "shippingbox")
-                }
-            } description: {
-                Text(model.connection == nil ? "添加 Amazon S3 或兼容端点。" : "在侧栏选择存储桶，或直接输入名称或 ARN。")
-            } actions: {
-                if model.connection == nil {
-                    Button("新建连接") { edit = ConnectionEdit(value: Connection(), existing: false) }.buttonStyle(.borderedProminent)
-                } else {
-                    HStack {
-                        TextField("存储桶名称或访问点 ARN", text: $bucketText).textFieldStyle(.roundedBorder).frame(width: 280)
-                            .onSubmit { openEnteredBucket() }
-                        Button("打开") { openEnteredBucket() }.buttonStyle(.borderedProminent)
-                    }
-                    if model.canWrite {
-                        Button("创建存储桶", action: showBucketCreation).disabled(!model.canCreateBucket)
-                    } else {
-                        Text("匿名连接可浏览有访问权限的存储桶。创建存储桶需要登录。")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    if let error = model.bucketError {
-                        Button("查看存储桶列表错误") { notice = Notice(title: "无法列出存储桶", body: error) }.buttonStyle(.link)
-                    }
-                }
+    private var browserPanes: some View {
+        BrowserPaneGrid(layout: layout) { pane in
+            GeometryReader { geometry in
+                let model = pane.model
+                ObjectBrowserPane(model: model, isActive: layout.active.id == pane.id,
+                                  splitSize: layout.isSplit ? geometry.size : nil, inspectorState: pane.inspector,
+                                  activate: { layout.activate(pane) }, close: { layout.close(pane) },
+                                  newConnection: {
+                                      layout.activate(pane)
+                                      edit = ConnectionEdit(value: Connection(), existing: false)
+                                  },
+                                  createBucket: {
+                                      layout.activate(pane)
+                                      showBucketCreation()
+                                  },
+                                  deleteBucket: { bucket in
+                                      layout.activate(pane)
+                                      showBucketDeletion(bucket)
+                                  },
+                                  remoteTransfer: { showRemoteTransfer(in: model) },
+                                  sync: { sync(upload: $0, in: model) }, download: { download($0, in: model) },
+                                  deleteObjects: { confirmDelete($0, in: model) },
+                                  copyObject: { item in
+                                      copyKey = item.key
+                                      copying = ObjectCopyPrompt(item: item, model: model, location: model.browserLocation)
+                                  }, notice: { notice = $0 })
             }
         }
-    }
-
-    private func display(_ item: S3Item) -> String {
-        let name = item.key.hasPrefix(model.prefix) ? String(item.key.dropFirst(model.prefix.count)) : item.key
-        if item.kind == .deleteMarker { return "\(name) · 删除标记" }
-        if item.kind == .version { return "\(name) · \(item.latest == true ? "当前版本" : "历史版本")" }
-        return name.isEmpty ? item.key : name
     }
 
     private func openEnteredBucket() {
@@ -626,16 +517,19 @@ struct ShelfWindow: View {
         bucketDeletion = model.bucketDeletionRequest(for: bucket)
     }
 
-    private func openPath(_ path: ObjectPath) {
-        if let name = path.bucket, name != model.bucket?.Name {
-            let destination = model.buckets.first { $0.Name == name } ?? Bucket(Name: name)
-            model.openBucket(destination, prefix: path.prefix)
-        } else {
-            model.go(path.prefix)
+    private func showRemoteTransfer(in model: Workspace) {
+        guard let connection = model.connection, let bucket = model.bucket else { return }
+        do {
+            let path = try RemoteTransferLocation.folder(model.prefix)
+            let source = RemoteTransferLocation(connection: connection, bucket: bucket.Name, prefix: path, bucketRegion: bucket.BucketRegion)
+            remoteTransfer = .init(source: source)
+        } catch {
+            notice = .init(title: "无法使用此源前缀", body: error.localizedDescription)
         }
     }
 
-    private func sync(upload: Bool) {
+    private func sync(upload: Bool, in model: Workspace) {
+        let location = model.browserLocation
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -644,20 +538,25 @@ struct ShelfWindow: View {
         panel.begin { result in
             guard result == .OK, let url = panel.url else { return }
             confirmation = Prompt(title: upload ? "同步到 S3？" : "同步到本地？",
-                                  message: "同步会新增或更新目标端的文件。", action: { model.sync(url, upload: upload) }, destructive: false)
+                                  message: "同步会新增或更新目标端的文件。",
+                                  action: { atLocation(location, in: model) { model.sync(url, upload: upload) } }, destructive: false)
         }
     }
 
-    private func upload() {
+    private func upload(in model: Workspace) {
+        let location = model.browserLocation
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = true
         panel.prompt = "上传"
-        panel.begin { result in if result == .OK { model.upload(panel.urls) } }
+        panel.begin { result in
+            if result == .OK { atLocation(location, in: model) { model.upload(panel.urls) } }
+        }
     }
 
-    private func download(_ item: S3Item) {
+    private func download(_ item: S3Item, in model: Workspace) {
+        let location = model.browserLocation
         let key = item.key
         let name = key.split(separator: "/").last.map(String.init) ?? "S3 对象"
         if item.kind == .folder {
@@ -666,32 +565,31 @@ struct ShelfWindow: View {
             panel.canChooseFiles = false
             panel.canCreateDirectories = true
             panel.prompt = "下载到此文件夹"
-            panel.begin { result in if result == .OK, let url = panel.url { model.download(item, to: url) } }
+            panel.begin { result in
+                if result == .OK, let url = panel.url { atLocation(location, in: model) { model.download(item, to: url) } }
+            }
         } else {
-            chooseSave(name: name) { model.download(item, to: $0) }
+            chooseSave(name: name) { url in atLocation(location, in: model) { model.download(item, to: url) } }
         }
     }
 
-    private func confirmDelete(_ items: [S3Item]) {
+    private func confirmDelete(_ items: [S3Item], in model: Workspace) {
+        let location = model.browserLocation
+        let name = model.connection?.name ?? ""
+        let path = Engine.s3URI(model.bucket?.Name ?? "", model.prefix)
+        let effect = model.versions ? "所选历史版本或删除标记将从 S3 移除。" : "S3 将根据存储桶的版本控制设置处理删除。"
         confirmation = Prompt(title: "删除 \(items.count) 项？",
-                              message: model.versions ? "所选历史版本或删除标记将从 S3 移除。" : "S3 将根据存储桶的版本控制设置处理删除。") { model.delete(items) }
-    }
-
-    private func itemAPI(_ command: String, _ item: S3Item) {
-        var fields = ["Key": item.key]
-        if let version = item.version { fields["VersionId"] = version }
-        model.shortcut(command, fields: fields)
-    }
-
-    private func openInspector(_ tab: InspectorTab, item: S3Item) {
-        model.selected = [item.id]
-        inspectorTab = tab
-        if tab.needsRequest, tab.cacheKinds.isEmpty, let bucket = model.bucket, let connection = model.currentConnection {
-            inspectorRequest = InspectorTarget(connectionID: connection.id, bucket: bucket, item: item, prefix: model.prefix)
-        } else {
-            inspectorRequest = nil
+                              message: "\(name)\n\(path)\n\n\(effect)") {
+            atLocation(location, in: model) { model.delete(items) }
         }
-        showInspector = true
+    }
+
+    private func atLocation(_ location: Workspace.BrowserLocation, in model: Workspace, action: () -> Void) {
+        guard model.matches(location) else {
+            notice = Notice(title: "窗格位置已变更", body: "请回到原连接、存储桶和路径后重新操作。")
+            return
+        }
+        action()
     }
 
     private func login(_ connection: Connection) {
@@ -701,20 +599,426 @@ struct ShelfWindow: View {
             defer { accessing = false }
             do {
                 _ = try await Engine.run(["sso", "login"], connection: connection, endpointOverride: false)
-                if model.connection?.id == connection.id { model.connect(connection) }
+                windowWorkspace.reloadAuthenticatedConnection(connection)
                 notice = Notice(title: "IAM Identity Center", body: "登录完成。")
             } catch { notice = Notice(title: "登录失败", body: error.localizedDescription) }
         }
     }
+}
 
+private struct ObjectCopyPrompt: Identifiable {
+    let id = UUID()
+    let item: S3Item
+    let model: Workspace
+    let location: Workspace.BrowserLocation
+}
+
+private struct ObjectBrowserPane: View {
+    @ObservedObject var model: Workspace
+    let isActive: Bool
+    let splitSize: CGSize?
+    @ObservedObject var inspectorState: PaneInspectorState
+    let activate: () -> Void
+    let close: () -> Void
+    let newConnection: () -> Void
+    let createBucket: () -> Void
+    let deleteBucket: (Bucket) -> Void
+    let remoteTransfer: () -> Void
+    let sync: (Bool) -> Void
+    let download: (S3Item) -> Void
+    let deleteObjects: ([S3Item]) -> Void
+    let copyObject: (S3Item) -> Void
+    let notice: (Notice) -> Void
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.colorSchemeContrast) private var contrast
+    @State private var bucketText = ""
+    @State private var dropTarget = false
+
+    private var compact: Bool { splitSize != nil }
+    private var showsPaneHighlight: Bool { compact && isActive }
+    private var paneOutline: Color {
+        if contrast == .increased { return Color.primary.opacity(0.85) }
+        return Color.primary.opacity(colorScheme == .dark ? 0.58 : 0.48)
+    }
+
+    var body: some View {
+        listing
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(nsColor: .windowBackgroundColor))
+            .overlay {
+                if showsPaneHighlight && !dropTarget {
+                    RoundedRectangle(cornerRadius: 5)
+                        .strokeBorder(paneOutline, lineWidth: 3)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
+            }
+            .contentShape(Rectangle())
+            .simultaneousGesture(TapGesture().onEnded(activate), including: compact ? .all : .none)
+            .onChange(of: model.connectionRevision) { _, _ in inspectorState.requestedTarget = nil }
+    }
+
+    private var paneTitleBackground: some View {
+        let tint = Color.primary.opacity(colorScheme == .dark ? 0.09 : 0.055)
+        return (showsPaneHighlight ? tint : Color.clear)
+            .overlay(alignment: .bottomLeading) {
+                if showsPaneHighlight {
+                    Capsule().fill(Color.accentColor.opacity(0.78))
+                        .frame(width: 40, height: 2).padding(.leading, 10)
+                }
+            }
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+    }
+
+    private var tableSelection: Binding<Set<String>> {
+        Binding(get: { model.selected }, set: { selected in
+            if !selected.isEmpty { activate() }
+            model.selected = selected
+        })
+    }
+
+    private var paneTitle: some View {
+        let title = [model.connection?.name, model.bucket?.Name].compactMap { $0 }.joined(separator: " / ")
+        return Button(action: activate) {
+            Label {
+                Text(title.isEmpty ? "选择连接" : title)
+            } icon: {
+                Image(systemName: isActive ? "circle.fill" : "circle")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(isActive ? Color.accentColor : Color.secondary)
+                    .frame(width: 12)
+            }
+            .font(.callout.weight(isActive ? .semibold : .medium)).lineLimit(1).truncationMode(.middle)
+            .labelStyle(.titleAndIcon)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(height: 36)
+            .contentShape(Rectangle())
+        }.buttonStyle(.plain)
+            .help(title.isEmpty ? "设为当前窗格" : title)
+            .accessibilityAddTraits(isActive ? [.isSelected] : [])
+            .accessibilityIdentifier("browser-pane-title")
+    }
+
+    private var closeButton: some View {
+        Button(action: close) { Image(systemName: "xmark").font(.caption.weight(.semibold)) }
+            .buttonStyle(.borderless).help("关闭窗格").accessibilityLabel("关闭窗格")
+    }
+
+    @ViewBuilder private func paneMenuLabel(_ title: String, symbol: String) -> some View {
+        if compact { Image(systemName: symbol).accessibilityLabel(title) }
+        else { Label(title, systemImage: symbol) }
+    }
+
+    @ViewBuilder private func inspector(for bucket: Bucket) -> some View {
+        if let connection = model.currentConnection {
+            let selected = model.selection
+            let target = InspectorTarget(connectionID: connection.id, bucket: bucket,
+                                         item: selected.count == 1 ? selected.first : nil, prefix: model.prefix)
+            let compactHeader = splitSize.map { $0.width < 540 || $0.height < 360 } ?? false
+            let minHeight = splitSize.map { min(110, max(72, $0.height - 190)) } ?? 130
+            let idealHeight = splitSize.map { min(253, max(minHeight, $0.height * 0.4)) } ?? 253
+            InspectorPane(model: model, target: target, tab: $inspectorState.tab,
+                          requestedTarget: $inspectorState.requestedTarget, download: download,
+                          compactHeader: compactHeader)
+                .frame(minHeight: minHeight, idealHeight: idealHeight, maxHeight: .infinity)
+        }
+    }
+
+    @ViewBuilder private var objectTable: some View {
+        if compact {
+            Table(model.visibleItems, selection: tableSelection) {
+                nameColumn
+                sizeColumn
+                dateColumn
+            }
+        } else {
+            Table(model.visibleItems, selection: tableSelection) {
+                nameColumn
+                sizeColumn
+                TableColumn("存储类别") { item in
+                    Text(item.storage ?? "—").foregroundStyle(.secondary).lineLimit(1)
+                }.width(min: 85, ideal: 110)
+                dateColumn
+            }
+        }
+    }
+
+    private var nameColumn: TableColumn<S3Item, Never, some View, Text> {
+        let column = TableColumn("名称") { (item: S3Item) in
+            Label {
+                Text(display(item)).lineLimit(1).truncationMode(.middle)
+            } icon: {
+                Image(systemName: item.icon).foregroundStyle(item.kind == .folder ? Color.accentColor : Color.secondary)
+            }.font(compact ? .callout : nil).help(item.key)
+        }
+        if let splitSize { return column.width(max(90, splitSize.width - 206)) }
+        return column.width(min: 160, ideal: 310)
+    }
+
+    private var sizeColumn: TableColumn<S3Item, Never, some View, Text> {
+        let column = TableColumn("大小") { (item: S3Item) in
+            Text(item.size.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "—")
+                .font((compact ? Font.caption : .callout).monospacedDigit()).foregroundStyle(.secondary)
+        }
+        return compact ? column.width(56) : column.width(min: 70, ideal: 85)
+    }
+
+    private var dateColumn: TableColumn<S3Item, Never, some View, Text> {
+        let column = TableColumn("更新时间") { (item: S3Item) in
+            let date = item.date.map { String($0.prefix(19)).replacingOccurrences(of: "T", with: " ") }
+            Text(date.map { compact ? String($0.prefix(16)) : $0 + " UTC" } ?? "—")
+                .font(.caption.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)
+                .help(date.map { $0 + " UTC" } ?? "")
+        }
+        return compact ? column.width(104) : column.width(min: 130, ideal: 150)
+    }
+
+    @ViewBuilder private var listing: some View {
+        if let bucket = model.bucket {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(alignment: .center, spacing: compact ? 9 : 12) {
+                    if compact {
+                        paneTitle
+                    } else {
+                        SectionHeading(title: bucket.Name, subtitle: bucket.BucketRegion ?? model.currentConnection.flatMap { $0.region.isEmpty ? nil : $0.region } ?? "Amazon S3")
+                        Spacer(minLength: 0)
+                    }
+                    if model.busy { ProgressView().controlSize(.small).accessibilityLabel("正在加载对象") }
+                    Menu {
+                        Button("删除所选对象", systemImage: "trash", role: .destructive) { deleteObjects(model.selection) }
+                            .disabled(!model.canWrite || model.selection.isEmpty || model.selection.contains(where: { $0.kind == .folder }))
+                        Menu("同步", systemImage: "arrow.triangle.2.circlepath") {
+                            Button("本地文件夹 → S3") { sync(true) }.disabled(!model.canWrite)
+                            Button("S3 → 本地文件夹") { sync(false) }
+                            Divider()
+                            Button("S3 → S3", systemImage: "arrow.left.arrow.right", action: remoteTransfer)
+                        }
+                    } label: { paneMenuLabel("对象操作", symbol: "ellipsis.circle") }
+                        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("对象操作")
+                    Menu {
+                        Button("版本控制") { shortcut("get-bucket-versioning") }
+                        Button("生命周期") { shortcut("get-bucket-lifecycle-configuration") }
+                        Button("存储桶策略") { shortcut("get-bucket-policy") }
+                        Button("默认加密") { shortcut("get-bucket-encryption") }
+                        Button("阻止公开访问") { shortcut("get-public-access-block") }
+                        Button("跨区域复制") { shortcut("get-bucket-replication") }
+                        Button("对象锁定") { shortcut("get-object-lock-configuration") }
+                        Button("CORS") { shortcut("get-bucket-cors") }
+                        Button("存储桶标签") { shortcut("get-bucket-tagging") }
+                        Divider()
+                        Button("删除存储桶…", systemImage: "trash", role: .destructive) { deleteBucket(bucket) }
+                            .disabled(!model.canDelete(bucket))
+                    } label: { paneMenuLabel("存储桶设置", symbol: "slider.horizontal.3") }
+                        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("存储桶设置")
+                    if compact {
+                        InspectorToggle(state: inspectorState, activate: activate)
+                            .labelStyle(.iconOnly).buttonStyle(.borderless)
+                            .foregroundStyle(inspectorState.isVisible ? Color.accentColor : Color.primary)
+                            .accessibilityIdentifier("pane-inspector-toggle")
+                        closeButton
+                    }
+                }.padding(.horizontal, compact ? 10 : 20).frame(height: compact ? 36 : nil)
+                    .padding(.top, compact ? 0 : 15).padding(.bottom, compact ? 0 : 13)
+                    .background { paneTitleBackground }
+                if compact { Divider() }
+                HStack(spacing: compact ? 6 : 10) {
+                    Button {
+                        model.go(ObjectPath.levels(in: model.prefix).dropLast().last?.prefix ?? "")
+                    } label: { Image(systemName: "arrow.up") }.disabled(model.prefix.isEmpty).help("上一级")
+                    Button { model.list() } label: { Image(systemName: "arrow.clockwise") }.keyboardShortcut(isActive ? KeyboardShortcut("r", modifiers: .command) : nil).help("刷新")
+                    PathBar(prefix: model.prefix, active: isActive, navigate: openPath)
+                        .id("\(model.connection?.id.uuidString ?? "")/\(bucket.id)")
+                    if !compact { FilterField("筛选已加载对象", text: $model.search).frame(width: 170) }
+                    Toggle("版本", isOn: Binding(get: { model.versions }, set: { model.setVersions($0) })).toggleStyle(.checkbox)
+                }.padding(.horizontal, compact ? 9 : 20).padding(.top, compact ? 6 : 0).padding(.bottom, compact ? 5 : 11)
+                if compact {
+                    FilterField("筛选已加载对象", text: $model.search).padding(.horizontal, 9).padding(.bottom, 6)
+                }
+                Divider()
+                if let error = model.error {
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: "exclamationmark.circle").foregroundStyle(.orange)
+                        ScrollView { Text(error).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 84)
+                        Button("重试") { model.list(more: model.hasMoreObjects && !model.needsListingRefresh) }.disabled(model.busy)
+                    }.padding(compact ? 8 : 12)
+                    Divider()
+                }
+                VSplitView {
+                    objectTable.contextMenu(forSelectionType: String.self) { selected in
+                        let items = model.selectedItems(selected)
+                        if let item = items.first, items.count == 1 {
+                            if item.kind == .folder { Button("打开文件夹") { model.go(item.key) } }
+                            if item.kind != .deleteMarker {
+                                Button("下载到…") { download(item) }
+                            }
+                            if item.kind == .object || item.kind == .version {
+                                Button("对象属性") { openInspector(.properties, item: item) }
+                                Button("对象标签") { openInspector(.tags, item: item) }
+                                Button("对象 ACL") { openInspector(.permissions, item: item) }
+                                Button("预览") { openInspector(.preview, item: item) }
+                                Button("恢复归档对象") { itemAPI("restore-object", item) }.disabled(!model.canWrite)
+                                if item.kind == .object {
+                                    Button("复制到同一存储桶…") { copyObject(item) }.disabled(!model.canWrite)
+                                    Button("复制预签名下载链接") { presign(item) }.disabled(!model.canWrite)
+                                }
+                            }
+                            Button("复制对象键") { copy(item.key) }
+                            if let version = item.version { Button("复制版本 ID") { copy(version) } }
+                            Button("复制 S3 URI") { copy(Engine.s3URI(bucket.Name, item.key)) }
+                        }
+                        if model.canWrite && !items.isEmpty && items.allSatisfy({ $0.kind != .folder }) {
+                            Divider()
+                            Button("删除", role: .destructive) { deleteObjects(items) }
+                        }
+                    } primaryAction: { selected in
+                        guard selected.count == 1, let item = model.selectedItems(selected).first else { return }
+                        activate()
+                        if item.kind == .folder { model.go(item.key) }
+                        else { openInspector(.properties, item: item) }
+                    }
+                    .overlay {
+                        if model.visibleItems.isEmpty && !model.busy && model.error == nil {
+                            ContentUnavailableView(model.search.isEmpty ? "此处没有对象" : "没有匹配的对象",
+                                                   systemImage: model.search.isEmpty ? "tray" : "magnifyingglass")
+                                .controlSize(.small).allowsHitTesting(false)
+                        }
+                    }
+                    .frame(minHeight: compact ? 45 : 110)
+                    if inspectorState.isVisible { inspector(for: bucket) }
+                }
+                Divider()
+                HStack {
+                    Text(model.search.isEmpty ? "已加载 \(model.items.count) 项" : "已加载的 \(model.items.count) 项中匹配 \(model.visibleItems.count) 项")
+                    if !model.selection.isEmpty { Text("· 已选 \(model.selection.count) 项") }
+                    Spacer()
+                    if model.needsListingRefresh {
+                        Button("清单有更新 · 刷新") { model.list() }.disabled(model.busy)
+                    } else if model.hasMoreObjects {
+                        Button("加载下一页") { model.list(more: true) }.disabled(model.busy)
+                    }
+                }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, compact ? 10 : 20).frame(height: compact ? 29 : 35)
+                    .background(.bar)
+            }.dropDestination(for: URL.self) { urls, _ in
+                guard model.canWrite, urls.contains(where: \.isFileURL) else { return false }
+                model.upload(urls)
+                return true
+            } isTargeted: { dropTarget = $0 && model.canWrite }
+            .overlay { if dropTarget { RoundedRectangle(cornerRadius: 9).strokeBorder(Color.accentColor, lineWidth: 3).allowsHitTesting(false) } }
+        } else if compact {
+            VStack(spacing: 0) {
+                HStack { paneTitle; closeButton }
+                    .padding(.horizontal, 10).frame(height: 36)
+                    .background { paneTitleBackground }
+                Divider()
+                if model.connection == nil {
+                    VStack(spacing: 8) {
+                        Label("从侧栏选择连接", systemImage: "server.rack").foregroundStyle(.secondary)
+                        Button("新建连接", action: newConnection)
+                    }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    VStack(spacing: 10) {
+                        Label("从侧栏选择存储桶", systemImage: "shippingbox").foregroundStyle(.secondary)
+                        HStack {
+                            TextField("存储桶名称或 ARN", text: $bucketText).textFieldStyle(.roundedBorder)
+                                .onSubmit(openEnteredBucket)
+                            Button("打开", action: openEnteredBucket).disabled(bucketText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }.frame(maxWidth: 310)
+                    }.padding(14).frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+        } else {
+            ContentUnavailableView {
+                if model.connection == nil {
+                    VStack(spacing: 12) {
+                        Image(nsImage: NSApp.applicationIconImage).resizable().scaledToFit()
+                            .frame(width: 72, height: 72).accessibilityHidden(true)
+                        Text("连接到对象存储")
+                    }
+                } else {
+                    Label("打开存储桶", systemImage: "shippingbox")
+                }
+            } description: {
+                Text(model.connection == nil ? "添加 Amazon S3 或兼容端点。" : "在侧栏选择存储桶，或直接输入名称或 ARN。")
+            } actions: {
+                if model.connection == nil {
+                    Button("新建连接") { newConnection() }.buttonStyle(.borderedProminent)
+                } else {
+                    HStack {
+                        TextField("存储桶名称或访问点 ARN", text: $bucketText).textFieldStyle(.roundedBorder).frame(width: 280)
+                            .onSubmit { openEnteredBucket() }
+                        Button("打开") { openEnteredBucket() }.buttonStyle(.borderedProminent)
+                    }
+                    if model.canWrite {
+                        Button("创建存储桶", action: createBucket).disabled(!model.canCreateBucket)
+                    } else {
+                        Text("匿名连接可浏览有访问权限的存储桶。创建存储桶需要登录。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    if let error = model.bucketError {
+                        Button("查看存储桶列表错误") { notice(Notice(title: "无法列出存储桶", body: error)) }.buttonStyle(.link)
+                    }
+                }
+            }
+        }
+    }
+
+    private func openEnteredBucket() {
+        let name = bucketText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        activate()
+        model.openBucket(Bucket(Name: name))
+        bucketText = ""
+    }
+
+    private func display(_ item: S3Item) -> String {
+        let name = item.key.hasPrefix(model.prefix) ? String(item.key.dropFirst(model.prefix.count)) : item.key
+        if item.kind == .deleteMarker { return "\(name) · 删除标记" }
+        if item.kind == .version { return "\(name) · \(item.latest == true ? "当前版本" : "历史版本")" }
+        return name.isEmpty ? item.key : name
+    }
+
+    private func openPath(_ path: ObjectPath) {
+        if let name = path.bucket, name != model.bucket?.Name {
+            let destination = model.buckets.first { $0.Name == name } ?? Bucket(Name: name)
+            model.openBucket(destination, prefix: path.prefix)
+        } else {
+            model.go(path.prefix)
+        }
+    }
+
+    private func itemAPI(_ command: String, _ item: S3Item) {
+        var fields = ["Key": item.key]
+        if let version = item.version { fields["VersionId"] = version }
+        activate()
+        model.shortcut(command, fields: fields)
+    }
+
+    private func openInspector(_ tab: InspectorTab, item: S3Item) {
+        activate()
+        model.selected = [item.id]
+        inspectorState.tab = tab
+        if tab.needsRequest, tab.cacheKinds.isEmpty, let bucket = model.bucket, let connection = model.currentConnection {
+            inspectorState.requestedTarget = InspectorTarget(connectionID: connection.id, bucket: bucket, item: item, prefix: model.prefix)
+        } else {
+            inspectorState.requestedTarget = nil
+        }
+        inspectorState.isVisible = true
+    }
+
+
+    private func shortcut(_ command: String) {
+        activate()
+        model.shortcut(command)
+    }
     private func presign(_ item: S3Item) {
         guard let bucket = model.bucket, let connection = model.currentConnection else { return }
         Task {
             do {
                 let data = try await Engine.run(["s3", "presign", Engine.s3URI(bucket.Name, item.key), "--expires-in=3600"], connection: connection)
                 copy(String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
-                notice = Notice(title: "已复制下载链接", body: "签名有效期为 1 小时，临时凭证提前过期时链接也会失效。")
-            } catch { notice = Notice(title: "无法创建下载链接", body: error.localizedDescription) }
+                notice(Notice(title: "已复制下载链接", body: "签名有效期为 1 小时，临时凭证提前过期时链接也会失效。"))
+            } catch { notice(Notice(title: "无法创建下载链接", body: error.localizedDescription)) }
         }
     }
 }
@@ -1036,11 +1340,12 @@ private struct CodeSurface: ViewModifier {
 struct TransfersView: View {
     @ObservedObject var model: Workspace
     var compact = false
+    @State private var retrySync: Transfer?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if !compact {
-                SectionHeading(title: "传输队列", subtitle: "\(model.activeTransfers) 项进行中 · 最多同时运行 3 项任务")
+                SectionHeading(title: "传输队列", subtitle: "\(model.activeTransfers) 项进行中 · \(queuePolicy)")
                     .padding(.horizontal, 20).padding(.vertical, 15)
                 Divider()
             }
@@ -1049,17 +1354,31 @@ struct TransfersView: View {
                     Text("暂无传输任务").foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     ContentUnavailableView("暂无传输任务", systemImage: "arrow.up.arrow.down",
-                                           description: Text("上传和下载进度会显示在这里。"))
+                                           description: Text("上传、下载和 S3 → S3 任务会显示在这里。"))
                 }
             } else {
                 ScrollView {
                     LazyVStack(spacing: 0) {
                         ForEach(model.transfers) { transfer in
                             HStack(spacing: 14) {
-                                Image(systemName: transfer.title.hasPrefix("上传") ? "arrow.up.circle" : "arrow.down.circle")
+                                Image(systemName: transfer.remote != nil ? "arrow.left.arrow.right.circle"
+                                      : transfer.title.hasPrefix("上传") ? "arrow.up.circle" : "arrow.down.circle")
                                     .font(.title2).foregroundStyle(Color.accentColor)
                                 VStack(alignment: .leading, spacing: 5) {
                                     Text(transfer.title).font(.headline).lineLimit(1).truncationMode(.middle)
+                                    if let remote = transfer.remote {
+                                        Text("\(remote.source.display) → \(remote.destination.display)")
+                                            .font(.caption).lineLimit(2).foregroundStyle(.secondary).textSelection(.enabled)
+                                        if let stats = transfer.remoteStats {
+                                            Text(stats.summary(running: transfer.status == .running, syncing: remote.mode == .sync))
+                                                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                            if transfer.status == .running, let fraction = stats.fraction {
+                                                ProgressView(value: fraction).controlSize(.small).accessibilityLabel("传输字节进度")
+                                            }
+                                        } else if transfer.status == .running {
+                                            Text("正在连接或比较对象…").font(.caption).foregroundStyle(.secondary)
+                                        }
+                                    }
                                     if !transfer.detail.isEmpty {
                                         Text(transfer.detail).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
                                             .lineLimit(4)
@@ -1074,7 +1393,10 @@ struct TransfersView: View {
                                     Button("取消") { model.cancel(transfer.id) }
                                 }
                                 if transfer.status == .failed || transfer.status == .cancelled {
-                                    Button("重试") { model.retry(transfer.id) }
+                                    Button("重试") {
+                                        if transfer.remote?.mode == .sync { retrySync = transfer }
+                                        else { model.retry(transfer.id) }
+                                    }
                                 }
                             }.padding(.vertical, 10)
                             Divider()
@@ -1083,6 +1405,18 @@ struct TransfersView: View {
                 }
             }
         }
+        .alert("重新执行 Sync？", isPresented: Binding(get: { retrySync != nil }, set: { if !$0 { retrySync = nil } }),
+               presenting: retrySync) { job in
+            Button("取消", role: .cancel) {}
+            Button("重新同步", role: .destructive) { model.retry(job.id) }
+        } message: { job in
+            Text("\(job.remote?.destination.display ?? "")\n源端没有的对象可能在此目标路径中被删除。")
+        }
+    }
+
+    private var queuePolicy: String {
+        guard let limit = model.transferPreferences.limitMiBPerSecond else { return "最多同时运行 3 项任务" }
+        return "全局限速 \(limit.formatted()) MiB/s · 逐项传输"
     }
 }
 

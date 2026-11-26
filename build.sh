@@ -1,6 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 project="$(cd "$(dirname "$0")" && pwd)"
+if ! command -v go >/dev/null; then
+  echo 'Go 1.26 or a Go installation with automatic toolchain downloads is required.' >&2
+  exit 1
+fi
 build_dir="${1:?Usage: build.sh BUILD_DIRECTORY [AWS_CLI_V2_PACKAGE]}"
 mkdir -p "$build_dir"
 build_dir="$(cd "$build_dir" && pwd)"
@@ -25,6 +29,32 @@ cp "$project/Resources/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 python3 "$project/catalog.py" "$cli" "$app/Contents/Resources/operations.json"
 ditto "$cli" "$app/Contents/Resources/aws-cli"
 cp "$scratch/aws/Resources/LICENSE.txt" "$app/Contents/Resources/AWS-CLI-LICENSE.txt"
+(
+  cd "$project/Tools/rclone-s3"
+  export GOWORK=off CGO_ENABLED=0 GOOS=darwin
+  for arch in arm64 amd64; do
+    GOARCH="$arch" go build -mod=readonly -trimpath \
+      -ldflags='-s -w -X github.com/rclone/rclone/fs.VersionSuffix=s3shelf' \
+      -o "$scratch/rclone-$arch" .
+    GOARCH="$arch" go list -mod=readonly -deps -f '{{with .Module}}{{if not .Main}}{{.Path}} {{.Dir}}{{end}}{{end}}' . \
+      >> "$scratch/rclone-linked-modules"
+  done
+  notices="$app/Contents/Resources/RCLONE-THIRD-PARTY.txt"
+  goroot="$(go env GOROOT)"
+  cat "$goroot/LICENSE" "$goroot/PATENTS" > "$notices"
+  sort -u "$scratch/rclone-linked-modules" | while read -r module directory; do
+    [[ -n "$module" ]] || continue
+    for file in "$directory"/{LICENSE,LICENCE,COPYING,NOTICE,THIRD_PARTY_NOTICES}{,.*}; do
+      [[ -f "$file" ]] || continue
+      printf '\n\n%s / %s\n\n' "$module" "${file##*/}"
+      cat "$file"
+    done
+  done >> "$notices"
+)
+xcrun lipo -create "$scratch/rclone-arm64" "$scratch/rclone-amd64" -output "$app/Contents/Resources/rclone"
+chmod 755 "$app/Contents/Resources/rclone"
+codesign --force --sign - "$app/Contents/Resources/rclone"
+cp "$project/Resources/RCLONE-LICENSE.txt" "$app/Contents/Resources/RCLONE-LICENSE.txt"
 for arch in arm64 x86_64; do
   xcrun swiftc -swift-version 6 -O -target "$arch-apple-macosx14.0" -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
     -o "$scratch/s3Shelf-$arch" "$project"/Sources/*.swift &

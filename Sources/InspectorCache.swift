@@ -43,12 +43,14 @@ struct InspectorCachePolicy: Equatable {
 @MainActor
 final class InspectorCache {
     private struct Resource: Hashable {
+        let connectionID: UUID
         let kind: InspectorCacheKind
         let bucket: String
         let key: Data?
         let version: Data?
 
         init(_ target: InspectorTarget, kind: InspectorCacheKind) {
+            connectionID = target.connectionID
             self.kind = kind
             bucket = target.bucket.Name
             let object = kind == .ownership ? nil : target.object
@@ -139,24 +141,33 @@ final class InspectorCache {
         }
     }
 
-    func invalidate(changes: [ObjectChange], kinds: Set<InspectorCacheKind>? = nil) {
-        func isAffected(_ resource: Resource) -> Bool {
-            (kinds?.contains(resource.kind) ?? true) && changes.contains(where: resource.isAffected)
-        }
-        for resource in entries.keys where isAffected(resource) { remove(resource) }
-        reads = reads.filter { !isAffected($0.key) }
+    func invalidate(connectionID: UUID) {
+        invalidateResources { $0.connectionID == connectionID }
     }
 
-    func invalidateMutation(_ command: String, change: ObjectChange) {
+    func invalidate(changes: [ObjectChange], connectionID: UUID, kinds: Set<InspectorCacheKind>? = nil) {
+        func isAffected(_ resource: Resource) -> Bool {
+            resource.connectionID == connectionID && (kinds?.contains(resource.kind) ?? true) &&
+                changes.contains(where: resource.isAffected)
+        }
+        invalidateResources(where: isAffected)
+    }
+
+    func invalidateMutation(_ command: String, change: ObjectChange, connectionID: UUID) {
         switch command {
         case "put-bucket-tagging", "delete-bucket-tagging", "put-object-tagging", "delete-object-tagging":
-            invalidate(changes: [change], kinds: [.tags, .headers])
+            invalidate(changes: [change], connectionID: connectionID, kinds: [.tags, .headers])
         case "put-bucket-acl", "put-object-acl", "put-bucket-policy", "delete-bucket-policy",
              "put-public-access-block", "delete-public-access-block",
              "put-bucket-ownership-controls", "delete-bucket-ownership-controls":
-            invalidate(changes: [change])
+            invalidate(changes: [change], connectionID: connectionID)
         default: break
         }
+    }
+
+    private func invalidateResources(where isAffected: (Resource) -> Bool) {
+        for resource in entries.keys where isAffected(resource) { remove(resource) }
+        reads = reads.filter { !isAffected($0.key) }
     }
 
     private func store<Value>(_ value: Value, bytes: Int, for resource: Resource) {

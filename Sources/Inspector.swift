@@ -221,6 +221,32 @@ enum InspectorTab: String, CaseIterable, Identifiable {
     var requiresAccessTarget: Bool { self == .permissions || self == .tags }
 }
 
+@MainActor
+final class PaneInspectorState: ObservableObject {
+    @Published var isVisible: Bool {
+        didSet { if !isVisible { requestedTarget = nil } }
+    }
+    @Published var tab = InspectorTab.properties
+    @Published var requestedTarget: InspectorTarget?
+
+    init(isVisible: Bool) { self.isVisible = isVisible }
+}
+
+struct InspectorToggle: View {
+    @ObservedObject var state: PaneInspectorState
+    var activate: () -> Void = {}
+
+    var body: some View {
+        let title = state.isVisible ? "隐藏详情" : "显示详情"
+        Button {
+            activate()
+            state.isVisible.toggle()
+        } label: {
+            Label(title, systemImage: "rectangle.bottomthird.inset.filled")
+        }.help(title)
+    }
+}
+
 struct InspectorCacheTimestamp: View {
     let date: Date
     var source = ""
@@ -250,39 +276,19 @@ struct InspectorPane: View {
     @Binding var tab: InspectorTab
     @Binding var requestedTarget: InspectorTarget?
     let download: (S3Item) -> Void
+    var compactHeader = false
     @State private var reload = 0
 
     var body: some View {
         let hasMultipleSelection = tab.requiresAccessTarget && model.selection.count > 1
         let isCachedTab = !tab.cacheKinds.isEmpty
         let shouldLoad = tab.needsRequest && (isCachedTab || requestedTarget == target) && !hasMultipleSelection
-        let refreshLabel = isCachedTab ? "强制刷新\(tab.rawValue)" : "刷新详情"
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 10) {
-                Label(target.scope, systemImage: target.item?.icon ?? "shippingbox")
-                    .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                Text(target.location).font(.system(.caption, design: .monospaced))
-                    .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
-                Spacer(minLength: 0)
-                Button { copy(target.location) } label: { Image(systemName: "document.on.document") }
-                    .buttonStyle(.borderless).help("复制 S3 URI")
-                if shouldLoad && (!tab.requiresAccessTarget || target.supportsAccessManagement) {
-                    Button(action: refreshCurrentTab) { Image(systemName: "arrow.clockwise") }
-                        .buttonStyle(.borderless)
-                        .accessibilityLabel(refreshLabel)
-                        .help(isCachedTab ? "\(refreshLabel)，从服务端重新读取" : refreshLabel)
-                }
-            }.padding(.horizontal, 17).padding(.top, 10).padding(.bottom, 8)
-            Picker("详情", selection: Binding(get: { tab }, set: { selection in
-                tab = selection
-                requestedTarget = selection.needsRequest && selection.cacheKinds.isEmpty ? target : nil
-            })) {
-                ForEach(InspectorTab.allCases) { tab in Text(tab.rawValue).tag(tab) }
-            }.pickerStyle(.segmented).labelsHidden().padding(.horizontal, 17).padding(.bottom, 9)
+            header(canRefresh: shouldLoad && (!tab.requiresAccessTarget || target.supportsAccessManagement), isCachedTab: isCachedTab)
             Divider()
             switch tab {
             case .tasks:
-                TransfersView(model: model, compact: true)
+                TransfersView(model: model.transferQueue, compact: true)
             case .events:
                 events
             default:
@@ -294,29 +300,76 @@ struct InspectorPane: View {
                     Group {
                         if tab == .permissions || tab == .tags { AccessManagementPane(client: client, tagsOnly: tab == .tags) }
                         else { InspectorContent(client: client, tab: tab, download: download, refresh: refreshCurrentTab) }
-                    }.id(ContentID(target: target, tab: tab, reload: reload,
+                    }.id(ContentID(target: target, tab: tab, reload: reload, connectionRevision: model.connectionRevision,
                                    cacheSession: isCachedTab ? ObjectIdentifier(client.inspectorCache) : nil,
                                    cacheEnabled: isCachedTab && model.inspectorCachePolicy.lifetimeSeconds > 0))
                 } else {
-                    VStack(alignment: .leading, spacing: 9) {
-                        if let item = target.item {
-                            HStack(spacing: 14) {
-                                if let size = item.size { Text(ByteCountFormatter.string(fromByteCount: size, countStyle: .file)) }
-                                if let storage = item.storage { Text(storage) }
-                                if let date = item.date { Text(date) }
-                            }.font(.caption).foregroundStyle(.secondary)
-                        } else if let region = target.bucket.BucketRegion {
-                            Text(region).font(.caption).foregroundStyle(.secondary)
-                        }
-                        Button("加载\(tab.rawValue)") { requestedTarget = target }
-                    }.padding(.horizontal, 17).padding(.vertical, 10)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    summary
                 }
             }
         }.background(Color(nsColor: .controlBackgroundColor))
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("详情 · \(target.location)")
             .onChange(of: target) { _, newTarget in
                 if requestedTarget != newTarget { requestedTarget = nil }
             }
+    }
+
+    private var tabPicker: some View {
+        Picker("详情", selection: Binding(get: { tab }, set: { selection in
+            tab = selection
+            requestedTarget = selection.needsRequest && selection.cacheKinds.isEmpty ? target : nil
+        })) {
+            ForEach(InspectorTab.allCases) { tab in Text(tab.rawValue).tag(tab) }
+        }
+        .labelsHidden()
+    }
+
+    private func header(canRefresh: Bool, isCachedTab: Bool) -> some View {
+        let refreshLabel = isCachedTab ? "强制刷新\(tab.rawValue)" : "刷新详情"
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: compactHeader ? 7 : 10) {
+                if compactHeader {
+                    tabPicker.pickerStyle(.menu).controlSize(.small).fixedSize()
+                } else {
+                    Label(target.scope, systemImage: target.item?.icon ?? "shippingbox")
+                        .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                }
+                Text(target.location).font(.system(.caption, design: .monospaced))
+                    .lineLimit(1).truncationMode(.middle).textSelection(.enabled).help(target.location)
+                Spacer(minLength: 0)
+                Button { copy(target.location) } label: { Image(systemName: "document.on.document") }
+                    .buttonStyle(.borderless).help("复制 S3 URI")
+                if canRefresh {
+                    Button(action: refreshCurrentTab) { Image(systemName: "arrow.clockwise") }
+                        .buttonStyle(.borderless)
+                        .accessibilityLabel(refreshLabel)
+                        .help(isCachedTab ? "\(refreshLabel)，从服务端重新读取" : refreshLabel)
+                }
+            }
+            if !compactHeader { tabPicker.pickerStyle(.segmented) }
+        }
+        .padding(.horizontal, compactHeader ? 10 : 17)
+        .padding(.vertical, compactHeader ? 5 : 9)
+    }
+
+    private var summary: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: compactHeader ? 5 : 9) {
+                if let item = target.item {
+                    HStack(spacing: 12) {
+                        if let size = item.size { Text(ByteCountFormatter.string(fromByteCount: size, countStyle: .file)) }
+                        if let storage = item.storage { Text(storage) }
+                        if let date = item.date { Text(date).lineLimit(1).help(date) }
+                    }.font(.caption).foregroundStyle(.secondary)
+                } else if let region = target.bucket.BucketRegion {
+                    Text(region).font(.caption).foregroundStyle(.secondary)
+                }
+                Button("加载\(tab.rawValue)") { requestedTarget = target }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, compactHeader ? 10 : 17).padding(.vertical, compactHeader ? 5 : 10)
+        }
     }
 
     private func refreshCurrentTab() {
@@ -328,6 +381,7 @@ struct InspectorPane: View {
         let target: InspectorTarget
         let tab: InspectorTab
         let reload: Int
+        let connectionRevision: UUID
         let cacheSession: ObjectIdentifier?
         let cacheEnabled: Bool
     }

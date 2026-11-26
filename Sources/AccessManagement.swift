@@ -317,7 +317,8 @@ extension InspectorClient {
         let bytes = parameters.isEmpty ? nil : try JSONSerialization.data(withJSONObject: parameters)
         defer {
             if writing {
-                inspectorCache.invalidateMutation(command, change: ObjectChange(bucket: target.bucket.Name, key: object?.key))
+                inspectorCache.invalidateMutation(command, change: ObjectChange(bucket: target.bucket.Name, key: object?.key),
+                                                  connectionID: target.connectionID)
             }
         }
         let result = try await fetch(command, requesterPays: object != nil && allowRequesterPays, inputJSON: bytes)

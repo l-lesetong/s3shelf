@@ -222,9 +222,10 @@ struct S3HTTPResponse: Sendable {
     }
 }
 
-private final class Child: @unchecked Sendable {
+final class Child: @unchecked Sendable {
     private let lock = NSLock()
     private let process = Process()
+    private let stopped = DispatchSemaphore(value: 0)
     private var cancelled = false
 
     func stop() {
@@ -232,11 +233,13 @@ private final class Child: @unchecked Sendable {
             cancelled = true
             if process.isRunning { process.terminate() }
         }
+        stopped.signal()
     }
 
     func run(_ executable: URL, _ arguments: [String], _ environment: [String: String],
              _ progress: OutputHandler?, response: ResponseHandler? = nil, captureServiceErrors: Bool = false,
-             literalObjectKey: String? = nil) throws -> Data {
+             literalObjectKey: String? = nil, errorProgress: OutputHandler? = nil,
+             throttledDownload: (file: URL, bytesPerSecond: Int64)? = nil) throws -> Data {
         let output = Pipe()
         let errors = Pipe()
         let errorData = ErrorBuffer()
@@ -264,21 +267,27 @@ private final class Child: @unchecked Sendable {
         let drains = DispatchGroup()
         drains.enter()
         DispatchQueue.global(qos: .userInitiated).async {
-            errorData.data = errors.fileHandleForReading.readDataToEndOfFile()
-            drains.leave()
+            defer { drains.leave() }
+            if let errorProgress {
+                _ = try? Self.read(errors.fileHandleForReading, progress: errorProgress)
+            } else {
+                errorData.data = errors.fileHandleForReading.readDataToEndOfFile()
+            }
         }
-        var data = Data()
-        var remainder = Data()
-        while let chunk = try output.fileHandleForReading.read(upToCount: 64 * 1024), !chunk.isEmpty {
-            if let progress {
-                remainder.append(chunk)
-                while let boundary = remainder.firstIndex(where: { $0 == 10 || $0 == 13 }) {
-                    if boundary != remainder.startIndex { progress(String(decoding: remainder[..<boundary], as: UTF8.self)) }
-                    remainder.removeSubrange(...boundary)
-                }
-            } else { data.append(chunk) }
+        let data: Data
+        do {
+            if let throttledDownload {
+                try save(output.fileHandleForReading, to: throttledDownload.file, bytesPerSecond: throttledDownload.bytesPerSecond)
+                data = Data()
+            } else {
+                data = try Self.read(output.fileHandleForReading, progress: progress)
+            }
+        } catch {
+            stop()
+            process.waitUntilExit()
+            drains.wait()
+            throw error
         }
-        if let progress, !remainder.isEmpty { progress(String(decoding: remainder, as: UTF8.self)) }
         process.waitUntilExit()
         drains.wait()
         if lock.withLock({ cancelled }) { throw CancellationError() }
@@ -287,6 +296,7 @@ private final class Child: @unchecked Sendable {
             ? S3HTTPResponse.parse(diagnostics, includeErrorCode: captureServiceErrors) : nil
         if let received { response?(received) }
         if process.terminationStatus != 0 {
+            if errorProgress != nil { throw ShelfError("退出状态码 \(process.terminationStatus)。") }
             // An empty S3 error message can make the AWS CLI S3 error formatter throw
             // before it reports the service's original error code.
             if captureServiceErrors, diagnostics.contains("awscli/customizations/s3errormsg.py"),
@@ -302,6 +312,34 @@ private final class Child: @unchecked Sendable {
             throw ShelfError(message.isEmpty ? "AWS CLI 退出状态码 \(process.terminationStatus)。" : message)
         }
         return data
+    }
+
+    private static func read(_ file: FileHandle, progress: OutputHandler?) throws -> Data {
+        guard let progress else { return try file.readToEnd() ?? Data() }
+        var remainder = Data()
+        while let chunk = try file.read(upToCount: 64 * 1024), !chunk.isEmpty {
+            remainder.append(chunk)
+            while let boundary = remainder.firstIndex(where: { $0 == 10 || $0 == 13 }) {
+                if boundary != remainder.startIndex { progress(String(decoding: remainder[..<boundary], as: UTF8.self)) }
+                remainder.removeSubrange(...boundary)
+            }
+            if remainder.count > 2 * 1024 * 1024 { remainder.removeAll(keepingCapacity: true) }
+        }
+        if !remainder.isEmpty { progress(String(decoding: remainder, as: UTF8.self)) }
+        return Data()
+    }
+
+    private func save(_ stream: FileHandle, to url: URL, bytesPerSecond: Int64) throws {
+        guard FileManager.default.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
+            throw ShelfError("无法在目标目录创建下载文件。")
+        }
+        let file = try FileHandle(forWritingTo: url)
+        defer { try? file.close() }
+        while let chunk = try stream.read(upToCount: 64 * 1024), !chunk.isEmpty {
+            let delay = Int(Int64(chunk.count) * 1_000_000_000 / bytesPerSecond)
+            if stopped.wait(timeout: .now() + .nanoseconds(delay)) == .success { throw CancellationError() }
+            try file.write(contentsOf: chunk)
+        }
     }
 
     private final class ErrorBuffer: @unchecked Sendable { var data = Data() }
@@ -340,6 +378,8 @@ enum Engine {
                     inputJSON: Data? = nil,
                     literalObjectKey: String? = nil,
                     maxAttempts: Int? = nil,
+                    transferSettings: [String: String] = [:],
+                    throttledDownload: (file: URL, bytesPerSecond: Int64)? = nil,
                     response: ResponseHandler? = nil,
                     progress: OutputHandler? = nil) async throws -> Data {
         let child = Child()
@@ -354,7 +394,7 @@ enum Engine {
                 if response != nil || captureServiceErrors { flags.append("--debug") }
                 var temporary: URL?
                 defer { if let temporary { try? FileManager.default.removeItem(at: temporary) } }
-                if inputJSON != nil || connection?.auth == .keys || connection?.pathStyle == true {
+                if inputJSON != nil || connection?.auth == .keys || connection?.pathStyle == true || !transferSettings.isEmpty {
                     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
                                                            attributes: [.posixPermissions: 0o700])
@@ -378,10 +418,11 @@ enum Engine {
                     }
                     if connection.auth == .profile, !connection.profile.isEmpty { flags.append("--profile=\(connection.profile)") }
                     if connection.auth == .anonymous { flags.append("--no-sign-request") }
-                    if (connection.auth == .keys || connection.pathStyle), let directory = temporary {
+                    if (connection.auth == .keys || connection.pathStyle || !transferSettings.isEmpty), let directory = temporary {
                         let config = directory.appendingPathComponent("config")
                         var content = "[default]\n"
-                        if connection.auth == .profile {
+                        let usesProfile = connection.auth == .profile || connection.auth == .anonymous && !connection.pathStyle
+                        if usesProfile {
                             let source = environment["AWS_CONFIG_FILE"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".aws/config").path
                             if FileManager.default.fileExists(atPath: source) {
                                 try FileManager.default.copyItem(at: URL(fileURLWithPath: source), to: config)
@@ -397,9 +438,15 @@ enum Engine {
                             try Data(content.utf8).write(to: config)
                         }
                         environment["AWS_CONFIG_FILE"] = config.path
+                        var overrides = transferSettings
                         if connection.auth == .profile, connection.pathStyle {
-                            let selectedProfile = connection.profile.isEmpty ? (environment["AWS_PROFILE"] ?? environment["AWS_DEFAULT_PROFILE"]) : connection.profile
-                            let args = ["configure", "set", "s3.addressing_style", "path"] + (selectedProfile.map { ["--profile=\($0)"] } ?? [])
+                            overrides["addressing_style"] = "path"
+                        }
+                        let selectedProfile = connection.auth == .profile && !connection.profile.isEmpty ? connection.profile
+                            : environment["AWS_PROFILE"] ?? environment["AWS_DEFAULT_PROFILE"]
+                        let profileFlags = selectedProfile.map { ["--profile=\($0)"] } ?? []
+                        for (key, value) in overrides.sorted(by: { $0.key < $1.key }) {
+                            let args = ["configure", "set", "s3.\(key)", value] + profileFlags
                             _ = try Child().run(executable(), args, environment, nil)
                         }
                     }
@@ -412,7 +459,8 @@ enum Engine {
                     }
                 }
                 return try child.run(executable(), flags + command, environment, progress,
-                                     response: response, captureServiceErrors: captureServiceErrors, literalObjectKey: literalObjectKey)
+                                     response: response, captureServiceErrors: captureServiceErrors, literalObjectKey: literalObjectKey,
+                                     throttledDownload: throttledDownload)
             }.value
         } onCancel: { child.stop() }
     }
