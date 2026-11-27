@@ -7,3 +7,5 @@
 *.dmg
 *.zip
 __pycache__/
+/Windows/**/bin/
+/Windows/**/obj/

@@ -2,6 +2,8 @@
 
 s3Shelf 是基于 SwiftUI 和 AppKit 的中文 macOS 对象存储客户端，支持 Amazon S3 和兼容端点。外观默认跟随系统，也可在「配置 → 外观」切换浅色或深色。
 
+Windows 客户端目前为预览版。系统要求、功能和构建方式见 [Windows 版说明](Windows/README.md)。
+
 <p align="center">
   <a href="docs/images/s3shelf-poster.png">
     <img src="docs/images/s3shelf-poster.png" width="480" alt="s3Shelf 发布海报，展示 macOS 浅色与深色分屏、跨桶 Copy 和 Sync，以及 ACL 和标签管理">
