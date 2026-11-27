@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -25,15 +26,46 @@ namespace S3Shelf
         internal string Cursor;
     }
 
+    internal sealed class ObjectPageCache
+    {
+        private const int MaxPages = 12;
+        private static readonly long Lifetime = 45 * Stopwatch.Frequency;
+        private readonly Dictionary<(Connection Source, string Bucket, string Prefix), (ObjectPage Page, long Loaded)> pages =
+            new Dictionary<(Connection Source, string Bucket, string Prefix), (ObjectPage Page, long Loaded)>();
+        internal long Revision { get; private set; }
+
+        internal ObjectPage Read((Connection Source, string Bucket, string Prefix) scope)
+        {
+            if (!pages.TryGetValue(scope, out var cached)) return null;
+            if (Stopwatch.GetTimestamp() - cached.Loaded < Lifetime) return cached.Page;
+            pages.Remove(scope);
+            return null;
+        }
+
+        internal void Store((Connection Source, string Bucket, string Prefix) scope, ObjectPage page, long revision)
+        {
+            if (revision != Revision) return;
+            if (pages.Count >= MaxPages && !pages.ContainsKey(scope))
+                pages.Remove(pages.OrderBy(item => item.Value.Loaded).First().Key);
+            pages[scope] = (page, Stopwatch.GetTimestamp());
+        }
+
+        internal void Invalidate(Connection source, string bucket = null, string prefix = null)
+        {
+            Revision++;
+            foreach (var scope in pages.Keys.Where(scope => scope.Source == source &&
+                (bucket == null || (scope.Bucket == bucket && (prefix == null || scope.Prefix == prefix)))).ToArray())
+                pages.Remove(scope);
+        }
+    }
+
     internal static class Storage
     {
-        private const long PartSize = 8L * 1024 * 1024;
-
-        internal static async Task<ObjectPage> ListAsync(IAmazonS3 client, string bucket, string prefix, string cursor, CancellationToken token)
+        internal static async Task<ObjectPage> ListAsync(IAmazonS3 client, string bucket, string prefix, string cursor, RequestPayer payer, CancellationToken token)
         {
             var page = await client.ListObjectsV2Async(new ListObjectsV2Request
             {
-                BucketName = bucket, Prefix = prefix, Delimiter = "/", MaxKeys = 1000, ContinuationToken = cursor
+                BucketName = bucket, Prefix = prefix, Delimiter = "/", MaxKeys = 1000, ContinuationToken = cursor, RequestPayer = payer
             }, token).ConfigureAwait(false);
             var folders = (page.CommonPrefixes ?? new List<string>()).Select(key => new ObjectEntry { Key = key, Folder = true });
             var objects = (page.S3Objects ?? new List<S3Object>()).Where(item => item.Key != prefix).Select(item => new ObjectEntry
@@ -43,33 +75,43 @@ namespace S3Shelf
             return new ObjectPage { Entries = folders.Concat(objects).ToArray(), Cursor = page.NextContinuationToken };
         }
 
-        internal static async Task UploadAsync(IAmazonS3 client, string bucket, string key, string path, Action<long, long> progress, CancellationToken token)
+        internal static async Task UploadAsync(IAmazonS3 client, string bucket, string key, string path, RequestPayer payer,
+            TransferPreferences preferences, Action<long, long> progress, CancellationToken token)
         {
-            using (var transfer = new TransferUtility(client, new TransferUtilityConfig { MinSizeBeforePartUpload = PartSize }))
+            var config = new TransferUtilityConfig { MinSizeBeforePartUpload = preferences.PartBytes };
+            var limited = preferences.BytesPerSecond > 0;
+            if (limited) config.ConcurrentServiceRequests = 1;
+            using (var transfer = new TransferUtility(client, config))
+            using (var stream = limited ? new PacedUploadStream(File.OpenRead(path), new TransferPacer(preferences.BytesPerSecond), token) : null)
             {
-                var length = new FileInfo(path).Length;
+                var length = stream?.Length ?? new FileInfo(path).Length;
                 // Round up when the default size would exceed S3's 10,000 part limit.
-                var partSize = Math.Max(PartSize, (length + 9999) / 10000);
-                var request = new TransferUtilityUploadRequest { BucketName = bucket, Key = key, FilePath = path, PartSize = partSize };
+                var partSize = Math.Max(preferences.PartBytes, (length + 9999) / 10000);
+                var request = new TransferUtilityUploadRequest { BucketName = bucket, Key = key, PartSize = partSize, RequestPayer = payer };
+                request.FilePath = limited ? null : path;
+                request.InputStream = stream;
                 request.UploadProgressEvent += (sender, args) => progress(args.TransferredBytes, args.TotalBytes);
                 await transfer.UploadAsync(request, token).ConfigureAwait(false);
                 progress(length, length);
             }
         }
 
-        internal static async Task DownloadAsync(IAmazonS3 client, string bucket, string key, string path, Action<long, long> progress, CancellationToken token)
+        internal static async Task DownloadAsync(IAmazonS3 client, string bucket, string key, string path, RequestPayer payer,
+            TransferPreferences preferences, Action<long, long> progress, CancellationToken token)
         {
             var temporary = Path.Combine(Path.GetDirectoryName(path), ".s3shelf-" + Guid.NewGuid().ToString("N") + ".part");
             try
             {
-                using (var response = await client.GetObjectAsync(bucket, key, token).ConfigureAwait(false))
+                using (var response = await client.GetObjectAsync(new GetObjectRequest { BucketName = bucket, Key = key, RequestPayer = payer }, token).ConfigureAwait(false))
                 using (var output = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, true))
                 {
-                    var buffer = new byte[128 * 1024];
+                    var pacer = new TransferPacer(preferences.BytesPerSecond);
+                    var buffer = new byte[pacer.ChunkSize];
                     long transferred = 0;
                     int count;
                     while ((count = await response.ResponseStream.ReadAsync(buffer, 0, buffer.Length, token).ConfigureAwait(false)) > 0)
                     {
+                        await pacer.WaitAsync(count, token).ConfigureAwait(false);
                         await output.WriteAsync(buffer, 0, count, token).ConfigureAwait(false);
                         transferred += count;
                         progress(transferred, response.ContentLength);

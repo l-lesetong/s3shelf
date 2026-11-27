@@ -24,6 +24,17 @@
           "AWSSDK.Core": "[4.1.1.1, 5.0.0)"
         }
       },
+      "System.Formats.Asn1": {
+        "type": "Direct",
+        "requested": "[8.0.2, )",
+        "resolved": "8.0.2",
+        "contentHash": "yUsFqNGa7tbwm5QOOnOR3VSoh8a0Yki39mTbhOnErdbg8hVSFtrK0EXerj286PXcegiF1LkE7lL++qqMZW5jIQ==",
+        "dependencies": {
+          "System.Buffers": "4.5.1",
+          "System.Memory": "4.5.5",
+          "System.ValueTuple": "4.5.0"
+        }
+      },
       "AWSSDK.Extensions.Numerics": {
         "type": "Transitive",
         "resolved": "4.1.0",

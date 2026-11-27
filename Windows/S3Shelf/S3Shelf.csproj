@@ -15,6 +15,7 @@
     <DebugType>none</DebugType>
   </PropertyGroup>
   <ItemGroup>
+    <EmbeddedResource Include="AppIcon.ico" LogicalName="S3Shelf.AppIcon.ico" />
     <Reference Include="System.Configuration" />
     <Reference Include="System.Drawing" />
     <Reference Include="System.Security" />
@@ -23,5 +24,6 @@
     <Reference Include="System.Xml.Linq" />
     <PackageReference Include="AWSSDK.S3" Version="4.1.2.1" />
     <PackageReference Include="AWSSDK.Core" Version="4.1.1.2" />
+    <PackageReference Include="System.Formats.Asn1" Version="8.0.2" />
   </ItemGroup>
 </Project>

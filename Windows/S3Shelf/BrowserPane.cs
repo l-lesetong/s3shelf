@@ -13,15 +13,30 @@ namespace S3Shelf
     internal sealed partial class BrowserPane : Panel
     {
         private readonly MainWindow window;
-        private readonly ComboBox connections = new ComboBox { Width = 150, DropDownStyle = ComboBoxStyle.DropDownList };
-        private readonly ComboBox buckets = new ComboBox { Width = 180, DropDownStyle = ComboBoxStyle.DropDownList };
-        private readonly TextBox path = new TextBox { Dock = DockStyle.Fill };
-        private readonly TextBox filter = new TextBox { Dock = DockStyle.Fill };
-        private readonly ListView objects = Theme.List();
-        private readonly Button more = Theme.Button("加载下一页");
-        private readonly Button moreBuckets = Theme.Button("更多桶");
-        private readonly Button detailsToggle = Theme.Button("详情");
-        private readonly Label status = new Label { AutoSize = true, ForeColor = Theme.Muted, Padding = new Padding(0, 4, 0, 0) };
+        private readonly PathBar path = new PathBar();
+        private readonly TextBox filter;
+        private readonly ListView objects = Theme.List(true);
+        private readonly ShelfButton more = Theme.Button("加载下一页");
+        private readonly ShelfButton detailsToggle = Theme.Button("查看详情", Glyph.Details, true);
+        private readonly ShelfButton close = Theme.Button("关闭窗格", Glyph.Close, true);
+        private readonly ShelfButton up = Theme.Button("上一级", Glyph.Up, true);
+        private readonly ShelfButton reload = Theme.Button("刷新对象", Glyph.Refresh, true);
+        private readonly ShelfButton objectMenu = Theme.Button("对象操作", Glyph.More, true);
+        private readonly ShelfButton bucketMenu = Theme.Button("存储桶设置", Glyph.Settings, true);
+        private readonly ShelfLabel status = Theme.Label("", true);
+        private readonly TableLayoutPanel heading;
+        private readonly ShelfLabel title;
+        private readonly ShelfLabel subtitle;
+        private readonly PaneEmptyState empty;
+        private readonly RowStyle titleHeight;
+        private readonly RowStyle navigationHeight;
+        private readonly RowStyle searchHeight;
+        private readonly RowStyle footerHeight;
+        private readonly TableLayoutPanel navigation;
+        private readonly Panel searchRow;
+        private readonly ColumnStyle inlineSearch;
+        private readonly FilterField search;
+        private IReadOnlyList<string> bucketNames = Array.Empty<string>();
         private readonly List<ObjectEntry> entries = new List<ObjectEntry>();
         private readonly HashSet<string> keys = new HashSet<string>(StringComparer.Ordinal);
         private readonly HashSet<string> cursors = new HashSet<string>(StringComparer.Ordinal);
@@ -36,121 +51,246 @@ namespace S3Shelf
         private string prefix = "";
         private string next;
         private string nextBucket;
-        private bool changingMenus;
         private bool listingBusy;
         private bool bucketBusy;
         private bool active;
+        private bool compact;
+        private bool listingFailed;
+        private bool cachedPage;
 
         internal BrowserPane(MainWindow window)
         {
             this.window = window;
             searchDelay = new TimerFilter(RenderObjects);
             Dock = DockStyle.Fill;
-            BackColor = Theme.Surface;
-            Padding = new Padding(3);
-            var toolbar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true, Margin = Padding.Empty, Padding = new Padding(5, 3, 5, 1), BackColor = Theme.Chrome };
-            var manual = Theme.Button("打开桶…");
-            moreBuckets.Enabled = more.Enabled = false;
-            connections.AccessibleName = "连接";
-            buckets.AccessibleName = "存储桶";
-            toolbar.Controls.AddRange(new Control[] { connections, buckets, moreBuckets, manual, detailsToggle });
-            foreach (var combo in new[] { connections, buckets }) { combo.BackColor = Theme.Surface; combo.ForeColor = Theme.Ink; }
+            Margin = Padding.Empty;
+            Theme.Paint(this, Fill.Surface);
+            SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
 
-            var navigation = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 4, RowCount = 1, Height = 36, Padding = new Padding(5, 2, 5, 1), BackColor = Theme.Chrome };
+            heading = Theme.Paint(new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1,
+                Margin = Padding.Empty, Padding = new Padding(14, 1, 10, 1) }, Fill.Surface);
+            heading.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            heading.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            heading.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            var titlePanel = new Panel { Dock = DockStyle.Fill };
+            title = Theme.Label();
+            title.Dock = DockStyle.Fill;
+            title.TextAlign = ContentAlignment.MiddleLeft;
+            title.Padding = new Padding(10, 0, 0, 0);
+            title.Paint += DrawTitleAccents;
+            subtitle = Theme.Label("", true);
+            subtitle.Dock = DockStyle.Bottom;
+            subtitle.Height = 24;
+            subtitle.TextAlign = ContentAlignment.TopLeft;
+            subtitle.Padding = new Padding(10, 1, 0, 0);
+            titlePanel.Controls.Add(title);
+            titlePanel.Controls.Add(subtitle);
+            heading.Controls.Add(titlePanel, 0, 0);
+
+            var actions = new FlowLayoutPanel { Anchor = AnchorStyles.Right, AutoSize = true, WrapContents = false, Margin = Padding.Empty };
+            actions.Controls.AddRange(new Control[] { objectMenu, bucketMenu, detailsToggle, close });
+            foreach (ShelfButton button in actions.Controls)
+            {
+                button.Quiet = true;
+                window.NameIcon(button);
+            }
+            heading.Controls.Add(actions, 1, 0);
+
+            navigation = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 4, RowCount = 1, Margin = Padding.Empty, Padding = new Padding(11, 0, 10, 0) };
+            navigation.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             navigation.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             navigation.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             navigation.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            navigation.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            var up = Theme.Button("上一级");
-            var reload = Theme.Button("刷新");
-            var go = Theme.Button("转到");
-            path.AccessibleName = "对象路径";
-            path.BackColor = filter.BackColor = Theme.Surface;
-            path.ForeColor = filter.ForeColor = Theme.Ink;
+            inlineSearch = new ColumnStyle(SizeType.Absolute, 0);
+            navigation.ColumnStyles.Add(inlineSearch);
+            window.NameIcon(up);
+            window.NameIcon(reload);
             navigation.Controls.Add(up, 0, 0);
             navigation.Controls.Add(reload, 1, 0);
             navigation.Controls.Add(path, 2, 0);
-            navigation.Controls.Add(go, 3, 0);
 
-            var search = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Height = 34, Padding = new Padding(7, 2, 5, 1), BackColor = Theme.Chrome };
-            search.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            search.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            search.Controls.Add(new Label { Text = "筛选已加载对象", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 0);
-            filter.AccessibleName = "筛选已加载对象";
-            search.Controls.Add(filter, 1, 0);
-
+            search = new FilterField { Margin = new Padding(5, 2, 2, 2) };
+            searchRow = new Panel { Dock = DockStyle.Fill, Margin = Padding.Empty, Padding = new Padding(8, 0, 10, 3) };
+            navigation.Controls.Add(search, 3, 0);
+            filter = search.Input;
+            objects.AccessibleName = "对象清单";
             objects.VirtualMode = true;
-            objects.Columns.Add("名称", 310);
-            objects.Columns.Add("大小", 86);
-            objects.Columns.Add("更新时间", 156);
-            objects.Columns.Add("存储类", 99);
+            objects.Columns.Add("名称", 290);
+            objects.Columns.Add("大小", 90);
+            objects.Columns.Add("存储类别", 112);
+            objects.Columns.Add("更新时间", 138);
             objects.RetrieveVirtualItem += (sender, args) =>
             {
                 if (args.ItemIndex < 0 || args.ItemIndex >= visibleEntries.Count)
                 {
-                    args.Item = new ListViewItem();
+                    args.Item = new ListViewItem(new[] { "", "", "", "" });
                     return;
                 }
                 var entry = visibleEntries[args.ItemIndex];
-                args.Item = new ListViewItem(new[] { DisplayKey(entry), entry.Size?.ToString("N0") ?? "", entry.Modified?.ToLocalTime().ToString("yyyy-MM-dd HH:mm") ?? "", entry.StorageClass ?? "" });
-                if (args.ItemIndex % 2 == 1) args.Item.BackColor = Theme.Chrome;
+                var dateFormat = !compact ? "yyyy-MM-dd HH:mm 'UTC'" : objects.ClientSize.Width < 360 * DeviceDpi / 96 ? "MM-dd HH:mm" : "yyyy-MM-dd HH:mm";
+                args.Item = new ListViewItem(new[] { DisplayKey(entry), entry.Size is long size ? Theme.Bytes(size) : "—",
+                    entry.StorageClass ?? "—", entry.Modified?.ToUniversalTime().ToString(dateFormat) ?? "—" }) { Tag = entry };
             };
             objects.SelectedIndexChanged += (sender, args) => { window.UpdateCommands(); SelectionChanged(); };
-            objects.DoubleClick += async (sender, args) => { var entry = Selected; if (entry?.Folder == true) await OpenAsync(bucket, entry.Key); else if (entry != null) window.Download(); };
+            objects.DoubleClick += async (sender, args) =>
+            {
+                var entry = Selected;
+                if (entry?.Folder == true) await OpenAsync(bucket, entry.Key);
+                else if (entry != null) window.Download();
+            };
             objects.KeyDown += async (sender, args) =>
             {
                 if (args.KeyCode == Keys.Enter && Selected?.Folder == true) { args.SuppressKeyPress = true; await OpenAsync(bucket, Selected.Key); }
             };
-            objects.Resize += (sender, args) => objects.Columns[0].Width = Math.Max(135, objects.ClientSize.Width - 367);
+            objects.Resize += (sender, args) => ResizeColumns();
             var context = new ContextMenuStrip();
             var download = context.Items.Add("下载…", null, (sender, args) => window.Download());
             var copy = context.Items.Add("复制 S3 URI", null, (sender, args) => window.CopyUri());
             var delete = context.Items.Add("删除对象…", null, async (sender, args) => await window.DeleteObjectAsync());
-            context.Opening += (sender, args) =>
+            void UpdateObjectMenu()
             {
                 window.ActivatePane(this);
                 download.Enabled = Selected != null && !Selected.Folder;
                 copy.Enabled = HasBucket;
                 delete.Enabled = CanWrite && download.Enabled;
-            };
+                Theme.TintMenu(context);
+            }
+            context.Opening += (sender, args) => UpdateObjectMenu();
             objects.ContextMenuStrip = context;
+            objectMenu.Click += (sender, args) => context.Show(objectMenu, new Point(0, objectMenu.Height));
+            bucketMenu.Click += (sender, args) => { window.ActivatePane(this); window.ShowBucketMenu(bucketMenu); };
 
-            body = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, Panel2Collapsed = true, BackColor = Theme.Chrome, SplitterWidth = 5 };
-            body.Panel1.Controls.Add(objects);
-            body.Panel2.Controls.Add(MakeDetails());
-            var footer = new FlowLayoutPanel { Dock = DockStyle.Fill, Height = 36, WrapContents = false, BackColor = Theme.Chrome, Padding = new Padding(6, 2, 0, 0) };
-            footer.Controls.AddRange(new Control[] { status, more });
-            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5, Margin = Padding.Empty, Padding = Padding.Empty };
-            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
-            layout.Controls.Add(toolbar, 0, 0);
-            layout.Controls.Add(navigation, 0, 1);
-            layout.Controls.Add(search, 0, 2);
-            layout.Controls.Add(body, 0, 3);
-            layout.Controls.Add(footer, 0, 4);
-            Controls.Add(layout);
-
-            connections.SelectedIndexChanged += async (sender, args) => { if (!changingMenus) await ConnectAsync((Connection)connections.SelectedItem); };
-            buckets.SelectedIndexChanged += async (sender, args) => { if (!changingMenus && buckets.SelectedItem is string name) await OpenAsync(name, ""); };
-            moreBuckets.Click += async (sender, args) => await LoadBucketsAsync(true);
-            more.Click += async (sender, args) => await LoadObjectsAsync(true);
-            manual.Click += async (sender, args) =>
+            var listingArea = Theme.Paint(new Panel { Dock = DockStyle.Fill }, Fill.Surface);
+            empty = new PaneEmptyState { Dock = DockStyle.Fill, TabStop = false };
+            empty.MouseDown += (sender, args) => window.ActivatePane(this);
+            empty.ActionClicked += async (sender, args) =>
             {
-                if (connection == null) { window.ShowError("请先选择连接。", "打开存储桶"); return; }
-                var name = Dialog.Ask(window, "打开存储桶", "存储桶名称");
-                if (!string.IsNullOrWhiteSpace(name)) await OpenAsync(name.Trim(), "");
+                window.ActivatePane(this);
+                if (connection == null) await window.ManageConnectionAsync(false, false);
+                else if (!HasBucket) await window.OpenNamedBucketAsync(this);
             };
+            listingArea.Controls.Add(objects);
+            listingArea.Controls.Add(empty);
+            body = Theme.Paint(new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, Panel2Collapsed = true, SplitterWidth = 3, Margin = Padding.Empty }, Fill.Line);
+            body.Panel1.Controls.Add(listingArea);
+            body.Panel2.Controls.Add(MakeDetails());
+            var footer = Theme.Paint(new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = Padding.Empty, Padding = new Padding(13, 0, 10, 0) }, Fill.Toolbar);
+            footer.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            status.Dock = DockStyle.Fill;
+            status.TextAlign = ContentAlignment.MiddleLeft;
+            footer.Controls.Add(status, 0, 0);
+            footer.Controls.Add(more, 1, 0);
+            var paneLayout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5, Margin = Padding.Empty };
+            titleHeight = new RowStyle(SizeType.Absolute, 68);
+            navigationHeight = new RowStyle(SizeType.Absolute, 34);
+            searchHeight = new RowStyle(SizeType.Absolute, 0);
+            footerHeight = new RowStyle(SizeType.Absolute, 31);
+            paneLayout.RowStyles.Add(titleHeight);
+            paneLayout.RowStyles.Add(navigationHeight);
+            paneLayout.RowStyles.Add(searchHeight);
+            paneLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            paneLayout.RowStyles.Add(footerHeight);
+            paneLayout.Controls.Add(heading, 0, 0);
+            paneLayout.Controls.Add(navigation, 0, 1);
+            paneLayout.Controls.Add(searchRow, 0, 2);
+            paneLayout.Controls.Add(body, 0, 3);
+            paneLayout.Controls.Add(footer, 0, 4);
+            Controls.Add(paneLayout);
+
+            more.Visible = false;
             detailsToggle.Click += (sender, args) => ToggleDetails();
+            close.Click += (sender, args) => window.ClosePane(this);
+            more.Click += async (sender, args) => await LoadObjectsAsync(true);
             up.Click += async (sender, args) => await UpAsync();
             reload.Click += async (sender, args) => await RefreshAsync();
-            go.Click += async (sender, args) => await GoAsync();
-            path.KeyDown += async (sender, args) => { if (args.KeyCode == Keys.Enter) { args.SuppressKeyPress = true; await GoAsync(); } };
+            path.Navigate += async target => { window.ActivatePane(this); await OpenAsync(bucket, target); };
+            path.Go += async value => { window.ActivatePane(this); await GoAsync(value); };
             filter.TextChanged += (sender, args) => searchDelay.Restart();
-            InstallFocusHandlers(layout);
-            status.Text = "选择连接以打开存储桶";
+            InstallFocusHandlers(paneLayout);
+            status.Text = "请选择连接";
+            UpdatePresentation();
+            ResizeColumns();
+        }
+
+        private void ResizeColumns()
+        {
+            var available = Math.Max(1, objects.ClientSize.Width - SystemInformation.VerticalScrollBarWidth);
+            var scale = DeviceDpi / 96f;
+            var size = (int)((compact ? 76 : 90) * scale);
+            var storage = compact ? 0 : (int)(110 * scale);
+            var date = (int)((!compact ? 155 : objects.ClientSize.Width < 360 * scale ? 94 : 132) * scale);
+            objects.Columns[0].Width = Math.Max(75, available - size - storage - date);
+            objects.Columns[1].Width = size;
+            objects.Columns[2].Width = storage;
+            objects.Columns[3].Width = date;
+        }
+
+        internal IReadOnlyList<string> BucketNames => bucketNames;
+        internal bool HasMoreBuckets => nextBucket != null;
+        internal bool BucketsLoading => bucketBusy;
+        internal bool DetailsVisible => !body.Panel2Collapsed;
+        internal Task SelectConnectionAsync(Connection selected) => selected == connection ? Task.CompletedTask : ConnectAsync(selected);
+        internal void EditPath() => path.StartEdit();
+
+        private void DrawTitleAccents(object sender, PaintEventArgs e)
+        {
+            if (!compact) return;
+            var selectedColor = active ? Theme.Accent : Theme.Muted;
+            using (var brush = new SolidBrush(selectedColor))
+            using (var pen = new Pen(selectedColor))
+            {
+                var dot = new Rectangle(1, (title.Height - 6) / 2, 6, 6);
+                if (active) e.Graphics.FillEllipse(brush, dot); else e.Graphics.DrawEllipse(pen, dot);
+                if (active) e.Graphics.FillRectangle(brush, 1, title.Height - 3, Math.Min(40, title.Width), 2);
+            }
+        }
+
+        private void UpdatePresentation()
+        {
+            var scale = DeviceDpi / 96f;
+            titleHeight.Height = (compact ? 36 : HasBucket ? 68 : 0) * scale;
+            navigationHeight.Height = HasBucket ? 34 * scale : 0;
+            searchHeight.Height = HasBucket && compact ? 31 * scale : 0;
+            footerHeight.Height = HasBucket ? 32 * scale : 0;
+            heading.Visible = compact || HasBucket;
+            navigation.Visible = HasBucket;
+            searchRow.Visible = HasBucket && compact;
+            inlineSearch.Width = compact || !HasBucket ? 0 : 179 * scale;
+            title.Text = compact && bucket != null ? connection.Name + " / " + bucket : bucket ?? connection?.Name ?? "对象浏览";
+            title.Font = compact ? Theme.Semibold : Theme.Heading;
+            title.Padding = new Padding(compact ? 14 : 10, 0, 0, 0);
+            subtitle.Text = bucket != null ? connection.RegionLabel : "Amazon S3";
+            subtitle.Visible = !compact;
+            Theme.Paint(heading, compact && active ? Fill.Stripe : Fill.Surface);
+            title.Invalidate();
+            detailsToggle.Enabled = HasBucket;
+            detailsToggle.Selected = DetailsVisible;
+            detailTabs.Visible = !compact;
+            detailPicker.Visible = compact;
+            objectMenu.IconOnly = bucketMenu.IconOnly = compact;
+            objectMenu.Visible = bucketMenu.Visible = detailsToggle.Visible = HasBucket;
+            up.Enabled = HasBucket && prefix.Length > 0;
+            reload.Enabled = connection != null;
+            path.Enabled = HasBucket;
+            filter.Enabled = HasBucket;
+            close.Visible = compact;
+            RefreshEmpty();
+        }
+
+        private void RefreshEmpty()
+        {
+            var show = !HasBucket || (!listingBusy && visibleEntries.Count == 0);
+            empty.Visible = show;
+            if (!show) return;
+            empty.BringToFront();
+            if (connection == null) empty.SetMessage(Glyph.Server, compact ? "从侧栏选择连接" : "连接到对象存储",
+                compact ? "" : "添加 Amazon S3 或兼容端点。", "新建连接", compact ? null : window.AppMark);
+            else if (!HasBucket) empty.SetMessage(Glyph.Bucket, "打开存储桶", "从侧栏选择存储桶，或按名称打开。", "按名称打开");
+            else if (listingFailed) empty.SetMessage(Glyph.Refresh, "加载对象失败", "使用路径栏上的刷新按钮重试。");
+            else if (filter.TextLength > 0) empty.SetMessage(Glyph.Search, "没有匹配的对象", "可清除筛选条件或加载更多对象。");
+            else empty.SetMessage(Glyph.Folder, "此处没有对象", "");
         }
 
         internal Connection CurrentConnection => connection;
@@ -171,11 +311,27 @@ namespace S3Shelf
         protected override void OnPaint(PaintEventArgs args)
         {
             base.OnPaint(args);
-            if (active) ControlPaint.DrawBorder(args.Graphics, ClientRectangle, Theme.Line, 3, ButtonBorderStyle.Solid,
-                Theme.Line, 3, ButtonBorderStyle.Solid, Theme.Line, 3, ButtonBorderStyle.Solid, Theme.Line, 3, ButtonBorderStyle.Solid);
+            if (!compact || !active) return;
+            var border = Math.Max(2, 3 * DeviceDpi / 96);
+            using (var pen = new Pen(Theme.StrongBorder, border))
+                args.Graphics.DrawRectangle(pen, Rectangle.Inflate(ClientRectangle, -border / 2, -border / 2));
         }
 
-        internal void Active(bool value) { active = value; Invalidate(); }
+        internal void Active(bool value, bool isSplit)
+        {
+            if (active == value && compact == isSplit) return;
+            active = value;
+            if (compact != isSplit)
+            {
+                if (isSplit) searchRow.Controls.Add(search);
+                else navigation.Controls.Add(search, 3, 0);
+            }
+            compact = isSplit;
+            Padding = compact ? new Padding(Math.Max(2, 3 * DeviceDpi / 96)) : Padding.Empty;
+            UpdatePresentation();
+            ResizeColumns();
+            Invalidate();
+        }
 
         protected override void Dispose(bool disposing)
         {
@@ -200,11 +356,6 @@ namespace S3Shelf
         {
             var previous = connection;
             var selected = preferred ?? (values.Contains(previous) ? previous : values.FirstOrDefault());
-            changingMenus = true;
-            connections.Items.Clear();
-            connections.Items.AddRange(values.Cast<object>().ToArray());
-            connections.SelectedItem = selected;
-            changingMenus = false;
             if (selected != previous) await ConnectAsync(selected);
         }
 
@@ -213,12 +364,17 @@ namespace S3Shelf
             bucketListing.Cancel(); bucketListing.Dispose(); bucketListing = new CancellationTokenSource();
             connection = selected;
             bucket = null;
-            changingMenus = true;
-            buckets.Items.Clear();
-            changingMenus = false;
+            bucketNames = Array.Empty<string>();
+            nextBucket = null;
+            bucketBusy = false;
             ClearLocation();
-            if (connection != null) await LoadBucketsAsync(false);
-            else { status.Text = "选择连接以打开存储桶"; moreBuckets.Enabled = false; }
+            status.Text = connection == null ? "请选择连接" : "正在读取存储桶…";
+            UpdatePresentation();
+            window.PaneLocationChanged(this);
+            if (!string.IsNullOrWhiteSpace(selected?.PreferredBucket))
+                await OpenAsync(selected.PreferredBucket.Trim(), "");
+            else if (selected != null)
+                await LoadBucketsAsync(false);
         }
 
         internal async Task LoadBucketsAsync(bool append)
@@ -233,25 +389,30 @@ namespace S3Shelf
             var capture = bucketListing;
             var token = capture.Token;
             bucketBusy = true;
-            moreBuckets.Enabled = false;
+            window.PaneLocationChanged(this);
             try
             {
                 using (var client = connection.Open())
                 {
                     var response = await client.ListBucketsAsync(new ListBucketsRequest { MaxBuckets = 1000, ContinuationToken = nextBucket }, token);
                     if (capture != bucketListing || IsDisposed) return;
-                    changingMenus = true;
-                    if (!append) buckets.Items.Clear();
-                    foreach (var item in response.Buckets ?? new List<S3Bucket>()) if (!buckets.Items.Contains(item.BucketName)) buckets.Items.Add(item.BucketName);
-                    if (bucket != null) { if (!buckets.Items.Contains(bucket)) buckets.Items.Add(bucket); buckets.SelectedItem = bucket; }
-                    changingMenus = false;
+                    var names = (response.Buckets ?? new List<S3Bucket>()).Select(item => item.BucketName);
+                    bucketNames = (append ? bucketNames.Concat(names) : names).Distinct(StringComparer.Ordinal)
+                        .OrderBy(name => name, StringComparer.CurrentCulture).ToArray();
                     nextBucket = string.IsNullOrEmpty(response.ContinuationToken) || !bucketCursors.Add(response.ContinuationToken) ? null : response.ContinuationToken;
-                    if (bucket == null) status.Text = buckets.Items.Count == 0 ? "可以手动打开存储桶" : "选择存储桶以浏览对象";
+                    if (bucket == null) status.Text = bucketNames.Count == 0 ? "可以手动打开存储桶" : "选择存储桶以浏览对象";
                 }
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { }
-            catch (Exception ex) { if (capture == bucketListing && !IsDisposed) window.ShowError(ex, "无法列出存储桶，可手动打开"); }
-            finally { if (capture == bucketListing && !IsDisposed) { bucketBusy = false; moreBuckets.Enabled = nextBucket != null; } }
+            catch (Exception ex)
+            {
+                if (capture != bucketListing || IsDisposed) return;
+                bucketBusy = false;
+                if (!HasBucket) status.Text = "无法列出存储桶，可手动打开";
+                window.PaneLocationChanged(this);
+                window.ShowError(ex, "无法列出存储桶，可手动打开");
+            }
+            finally { if (capture == bucketListing && !IsDisposed) { bucketBusy = false; window.PaneLocationChanged(this); } }
         }
 
         internal async Task OpenAsync(string name, string folder)
@@ -260,12 +421,9 @@ namespace S3Shelf
             ClearLocation();
             bucket = name;
             prefix = folder;
-            changingMenus = true;
-            if (!buckets.Items.Contains(name)) buckets.Items.Add(name);
-            buckets.SelectedItem = name;
-            changingMenus = false;
-            path.Text = "s3://" + bucket + "/" + prefix;
-            window.UpdateCommands();
+            path.SetLocation(bucket, prefix);
+            UpdatePresentation();
+            window.PaneLocationChanged(this);
             SelectionChanged();
             await LoadObjectsAsync(false);
         }
@@ -273,26 +431,32 @@ namespace S3Shelf
         internal void CloseBucket()
         {
             bucket = null;
-            changingMenus = true;
-            buckets.SelectedIndex = -1;
-            changingMenus = false;
             ClearLocation();
             status.Text = "选择存储桶以浏览对象";
+            UpdatePresentation();
+            window.PaneLocationChanged(this);
         }
 
-        internal Task RefreshAsync() => HasBucket ? OpenAsync(bucket, prefix) : LoadBucketsAsync(false);
+        internal Task RefreshAsync()
+        {
+            if (!HasBucket) return LoadBucketsAsync(false);
+            window.ListingCache.Invalidate(connection, bucket, prefix);
+            return OpenAsync(bucket, prefix);
+        }
 
         private void ClearLocation()
         {
             listing.Cancel(); listing.Dispose(); listing = new CancellationTokenSource();
-            listingBusy = false;
+            listingBusy = listingFailed = false;
+            cachedPage = false;
             entries.Clear(); keys.Clear(); cursors.Clear(); next = null;
-            path.Clear();
-            more.Enabled = false;
+            path.SetLocation(null, "");
+            more.Visible = false;
             RenderObjects();
             CancelDetails();
             detailText.Clear();
             detailStatus.Text = "";
+            detailLocation.Text = "";
             window.UpdateCommands();
         }
 
@@ -304,26 +468,35 @@ namespace S3Shelf
             listingBusy = true;
             more.Enabled = false;
             status.Text = "正在加载对象…";
+            listingFailed = false;
+            RefreshEmpty();
             try
             {
-                using (var client = connection.Open())
+                var scope = (connection, bucket, prefix);
+                var page = append ? null : window.ListingCache.Read(scope);
+                if (page == null)
                 {
-                    var page = await Storage.ListAsync(client, bucket, prefix, append ? next : null, token);
+                    var revision = window.ListingCache.Revision;
+                    using (var client = connection.Open())
+                        page = await Storage.ListAsync(client, bucket, prefix, append ? next : null, connection.Payer, token);
                     if (capture != listing || IsDisposed) return;
-                    foreach (var entry in page.Entries)
-                        if (keys.Add((entry.Folder ? "P" : "O") + entry.Key)) entries.Add(entry);
-                    next = string.IsNullOrEmpty(page.Cursor) || !cursors.Add(page.Cursor) ? null : page.Cursor;
-                    RenderObjects();
+                    if (!append) window.ListingCache.Store(scope, page, revision);
                 }
+                else cachedPage = true;
+                foreach (var entry in page.Entries)
+                    if (keys.Add((entry.Folder ? "P" : "O") + entry.Key)) entries.Add(entry);
+                next = string.IsNullOrEmpty(page.Cursor) || !cursors.Add(page.Cursor) ? null : page.Cursor;
+                RenderObjects();
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { }
             catch (Exception ex)
             {
                 if (capture != listing || IsDisposed) return;
+                listingFailed = !append;
                 status.Text = "加载失败，可刷新重试";
                 window.ShowError(ex, "无法加载对象");
             }
-            finally { if (capture == listing && !IsDisposed) { listingBusy = false; more.Enabled = next != null; } }
+            finally { if (capture == listing && !IsDisposed) { listingBusy = false; more.Enabled = more.Visible = next != null; RefreshEmpty(); } }
         }
 
         private Task UpAsync()
@@ -333,10 +506,9 @@ namespace S3Shelf
             return OpenAsync(bucket, index < 0 ? "" : prefix.Substring(0, index + 1));
         }
 
-        private Task GoAsync()
+        private Task GoAsync(string entered)
         {
             if (connection == null) return Task.CompletedTask;
-            var entered = path.Text;
             var targetBucket = bucket;
             if (entered.StartsWith("s3://", StringComparison.OrdinalIgnoreCase))
             {
@@ -363,7 +535,12 @@ namespace S3Shelf
             objects.VirtualListSize = visibleEntries.Count;
             objects.Invalidate();
             objects.EndUpdate();
-            if (HasBucket) status.Text = query.Length == 0 ? $"已加载 {entries.Count:N0} 项" : $"匹配 {visibleEntries.Count:N0} 项 / {entries.Count:N0} 项";
+            RefreshEmpty();
+            if (HasBucket)
+            {
+                var count = query.Length == 0 ? $"已加载 {entries.Count:N0} 项" : $"匹配 {visibleEntries.Count:N0} 项 / {entries.Count:N0} 项";
+                status.Text = cachedPage ? count + " · 首屏缓存" : count;
+            }
         }
 
         private sealed class TimerFilter : IDisposable

@@ -7,6 +7,7 @@ using System.Text;
 using System.Xml.Serialization;
 using Amazon;
 using Amazon.Runtime;
+using Amazon.Runtime.CredentialManagement;
 using Amazon.S3;
 
 namespace S3Shelf
@@ -16,12 +17,29 @@ namespace S3Shelf
     public sealed class Connection
     {
         public string Name { get; set; } = "S3";
-        public string Region { get; set; } = "us-east-1";
+        public string Region { get; set; } = "";
         public string Endpoint { get; set; } = "";
         public string Profile { get; set; } = "default";
+        public string PreferredBucket { get; set; } = "";
+        public string CaBundle { get; set; } = "";
+        public bool SkipTlsVerification { get; set; }
+        public bool RequesterPays { get; set; }
         public bool PathStyle { get; set; }
         public Authentication Authentication { get; set; }
         public string ProtectedCredentials { get; set; } = "";
+
+        [XmlIgnore]
+        internal string RegionLabel => string.IsNullOrWhiteSpace(Region) ? "自动" : Region.Trim();
+        internal RequestPayer Payer => RequesterPays && Authentication != Authentication.Anonymous ? RequestPayer.Requester : null;
+
+        internal static Uri ParseEndpoint(string endpoint)
+        {
+            if (!Uri.TryCreate(endpoint, UriKind.Absolute, out var uri) ||
+                (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps) ||
+                uri.Host.Length == 0 || uri.UserInfo.Length > 0 || uri.Query.Length > 0 || uri.Fragment.Length > 0)
+                return null;
+            return uri;
+        }
 
         internal string[] Credentials()
         {
@@ -38,29 +56,47 @@ namespace S3Shelf
 
         internal AmazonS3Client Open()
         {
-            var config = new AmazonS3Config { ForcePathStyle = PathStyle };
-            if (string.IsNullOrEmpty(Endpoint)) config.RegionEndpoint = RegionEndpoint.GetBySystemName(Region);
+            CredentialProfile profile = null;
+            AWSCredentials credentials;
+            if (Authentication == Authentication.AwsProfile)
+            {
+                var profileName = string.IsNullOrWhiteSpace(Profile) ? "default" : Profile.Trim();
+                var chain = new CredentialProfileStoreChain();
+                if (!chain.TryGetProfile(profileName, out profile) ||
+                    !AWSCredentialsFactory.TryGetAWSCredentials(profile, chain, out credentials))
+                    throw new InvalidOperationException("找不到可用的 AWS Profile「" + profileName + "」。");
+            }
+            else if (Authentication == Authentication.Anonymous) credentials = new AnonymousAWSCredentials();
             else
             {
-                config.ServiceURL = Endpoint;
-                config.AuthenticationRegion = Region;
+                var fields = Credentials();
+                credentials = string.IsNullOrEmpty(fields[2])
+                    ? (AWSCredentials)new BasicAWSCredentials(fields[0], fields[1])
+                    : new SessionAWSCredentials(fields[0], fields[1], fields[2]);
+            }
+
+            var region = ResolveRegion(profile);
+            var endpoint = string.IsNullOrWhiteSpace(Endpoint) ? null : ParseEndpoint(Endpoint.Trim());
+            if (endpoint == null && !string.IsNullOrWhiteSpace(Endpoint))
+                throw new InvalidOperationException("请输入有效的 HTTP 或 HTTPS 端点。");
+            var config = new AmazonS3Config { ForcePathStyle = PathStyle };
+            if (endpoint == null) config.RegionEndpoint = RegionEndpoint.GetBySystemName(region);
+            else
+            {
+                config.ServiceURL = Endpoint.Trim();
+                config.AuthenticationRegion = region;
                 config.RequestChecksumCalculation = RequestChecksumCalculation.WHEN_REQUIRED;
                 config.ResponseChecksumValidation = ResponseChecksumValidation.WHEN_REQUIRED;
             }
-            if (Authentication == Authentication.Anonymous) return new AmazonS3Client(new AnonymousAWSCredentials(), config);
-            if (Authentication == Authentication.AwsProfile)
-            {
-                var chain = new Amazon.Runtime.CredentialManagement.CredentialProfileStoreChain();
-                if (!chain.TryGetAWSCredentials(Profile, out var credentials))
-                    throw new InvalidOperationException("找不到 AWS 配置档案「" + Profile + "」。");
-                return new AmazonS3Client(credentials, config);
-            }
-            var fields = Credentials();
-            AWSCredentials keys = string.IsNullOrEmpty(fields[2])
-                ? (AWSCredentials)new BasicAWSCredentials(fields[0], fields[1])
-                : new SessionAWSCredentials(fields[0], fields[1], fields[2]);
-            return new AmazonS3Client(keys, config);
+            if (endpoint?.Scheme == Uri.UriSchemeHttps && (SkipTlsVerification || !string.IsNullOrWhiteSpace(CaBundle)))
+                return new EndpointTlsClient(credentials, config, endpoint, SkipTlsVerification ? null : EndpointCaBundle.Load(CaBundle));
+            return new AmazonS3Client(credentials, config);
         }
+
+        private string ResolveRegion(CredentialProfile profile) =>
+            new[] { Region, Environment.GetEnvironmentVariable("AWS_REGION"),
+                Environment.GetEnvironmentVariable("AWS_DEFAULT_REGION"), profile?.Region?.SystemName }
+                .FirstOrDefault(region => !string.IsNullOrWhiteSpace(region))?.Trim() ?? "us-east-1";
 
         public override string ToString() => Name;
     }
