@@ -16,6 +16,7 @@ VIAddVersionKey /LANG=2052 "ProductName" "s3Shelf"
 VIAddVersionKey /LANG=2052 "FileDescription" "s3Shelf Windows 安装程序"
 VIAddVersionKey /LANG=2052 "FileVersion" "${VERSION}"
 VIAddVersionKey /LANG=2052 "ProductVersion" "${VERSION}"
+VIAddVersionKey /LANG=2052 "Comments" "构建时间 ${BUILD_TIMESTAMP}"
 VIAddVersionKey /LANG=2052 "LegalCopyright" "s3Shelf contributors"
 
 Page directory

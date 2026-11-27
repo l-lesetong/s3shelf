@@ -10,18 +10,14 @@ $ErrorActionPreference = 'Stop'
 $project = Join-Path $PSScriptRoot 'S3Shelf/S3Shelf.csproj'
 $Output = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Output)
 $null = New-Item -ItemType Directory -Path $Output -Force
-if (-not $Version) {
+$buildTime = [DateTimeOffset]::UtcNow.ToOffset([TimeSpan]::FromHours(8))
+$buildTimestamp = $buildTime.ToString('yyyyMMdd-HHmmss-fff', [Globalization.CultureInfo]::InvariantCulture) + '+0800'
+if ($Version) {
+    $artifactId = $Version
+} else {
     $projectXml = [xml](Get-Content -LiteralPath $project -Raw)
-    $nextVersion = [version]($projectXml.SelectSingleNode('/Project/PropertyGroup/Version').InnerText)
-    foreach ($artifact in Get-ChildItem -LiteralPath $Output -File) {
-        if ($artifact.Name -match '^s3Shelf-(\d+\.\d+\.\d+)-Windows-(Setup\.exe|Portable\.zip)$') {
-            $previous = [version]$Matches[1]
-            if ($previous -ge $nextVersion) {
-                $nextVersion = [version]::new($previous.Major, $previous.Minor, ($previous.Build + 1))
-            }
-        }
-    }
-    $Version = $nextVersion.ToString()
+    $Version = $projectXml.SelectSingleNode('/Project/PropertyGroup/Version').InnerText
+    $artifactId = $buildTimestamp
 }
 
 $msbuild = Get-Command msbuild -ErrorAction SilentlyContinue
@@ -71,10 +67,10 @@ try {
     $files = Get-ChildItem -LiteralPath $payload -File | Sort-Object Name
     $list = Join-Path $scratch 'payload.nsh'
     $files | ForEach-Object { '!insertmacro PayloadFile "' + $_.Name + '"' } | Set-Content -LiteralPath $list -Encoding ASCII
-    $base = "s3Shelf-$Version-Windows"
+    $base = "s3Shelf-$artifactId-Windows"
     $setup = Join-Path $scratch "$base-Setup.exe"
     $switch = if ([Environment]::OSVersion.Platform -eq 'Win32NT') { '/D' } else { '-D' }
-    & $MakeNSIS "${switch}VERSION=$Version" "${switch}PAYLOAD=$payload" "${switch}PAYLOAD_LIST=$list" "${switch}SETUP=$setup" (Join-Path $PSScriptRoot 'installer/s3shelf.nsi')
+    & $MakeNSIS "${switch}VERSION=$Version" "${switch}BUILD_TIMESTAMP=$buildTimestamp" "${switch}PAYLOAD=$payload" "${switch}PAYLOAD_LIST=$list" "${switch}SETUP=$setup" (Join-Path $PSScriptRoot 'installer/s3shelf.nsi')
     if ($LASTEXITCODE -ne 0) { throw "NSIS failed with exit code $LASTEXITCODE." }
     $zip = Join-Path $scratch "$base-Portable.zip"
     Compress-Archive -LiteralPath $payload -DestinationPath $zip

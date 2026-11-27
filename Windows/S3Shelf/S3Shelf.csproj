@@ -4,7 +4,7 @@
     <TargetFramework>net48</TargetFramework>
     <AssemblyName>s3Shelf</AssemblyName>
     <RootNamespace>S3Shelf</RootNamespace>
-    <Version>1.5.11</Version>
+    <Version>1.5.14</Version>
     <ApplicationIcon>AppIcon.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
